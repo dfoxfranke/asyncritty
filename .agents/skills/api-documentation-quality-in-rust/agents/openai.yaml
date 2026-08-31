@@ -1,0 +1,3 @@
+interface:
+  display_name: "Rust API Documentation Profile"
+  short_description: "Apply Rust-specific API documentation rules"

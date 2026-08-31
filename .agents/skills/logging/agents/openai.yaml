@@ -1,0 +1,3 @@
+interface:
+  display_name: "Logging"
+  short_description: "Write and review useful operational logging"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Unsafe Code in Rust"
+  short_description: "Write and review justified, sound unsafe Rust"
+  default_prompt: "Use $unsafe-code-in-rust to decide whether this unsafe Rust is justified and review its safety contracts and comments."

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Error Handling in Rust"
+  short_description: "Design and review robust Rust error handling"

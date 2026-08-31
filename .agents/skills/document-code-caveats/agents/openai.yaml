@@ -1,0 +1,4 @@
+interface:
+  display_name: "Document Code Caveats"
+  short_description: "Explain workarounds, deferred defects, and complexity"
+  default_prompt: "Use $document-code-caveats to write or review a source comment for this workaround, deferred defect, or irreducibly complex code."

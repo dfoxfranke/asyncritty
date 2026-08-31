@@ -1,0 +1,4 @@
+interface:
+  display_name: "Work in Vendored Forks"
+  short_description: "Apply upstream conventions in vendored forks"
+  default_prompt: "Use $work-in-vendored-forks to identify the fork boundary and apply the relevant upstream conventions to this task."

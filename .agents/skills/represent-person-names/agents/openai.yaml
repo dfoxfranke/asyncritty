@@ -1,0 +1,3 @@
+interface:
+  display_name: "Represent Person Names"
+  short_description: "Represent personal names faithfully in documentation"

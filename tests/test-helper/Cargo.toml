@@ -1,0 +1,29 @@
+[package]
+name = "asyncritty-test-helper"
+version = "0.0.0"
+edition = "2024"
+publish = false
+autobins = false
+
+[dependencies]
+asyncritty = { path = "../..", default-features = false }
+libc = "0.2"
+rustix-openpty = "0.2.0"
+tokio = { version = "1.53.1", features = ["io-util", "rt"] }
+
+[dev-dependencies]
+ntest = "0.9.5"
+
+[[bin]]
+name = "asyncritty-utf8-test-helper"
+path = "src/bin/asyncritty-utf8-test-helper.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "asyncritty-low-fd-test-helper"
+path = "src/bin/asyncritty-low-fd-test-helper.rs"
+test = false
+bench = false
+doc = false

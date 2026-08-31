@@ -1,0 +1,27 @@
+[workspace]
+members = [".", "tests/test-helper"]
+default-members = [".", "tests/test-helper"]
+resolver = "3"
+
+[package]
+name = "asyncritty"
+version = "0.1.0-alpha1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Async Tokio integration for alacritty_terminal"
+keywords = ["async", "terminal", "tokio", "pty", "alacritty"]
+repository = "https://github.com/dfoxfranke/asyncritty"
+
+[dependencies]
+alacritty_terminal = { version = "0.26.0", default-features = false }
+cfg-if = "1.0.0"
+libc = "0.2"
+rustix = { version = "1.0.0", features = ["event", "termios"] }
+rustix-openpty = "0.2.0"
+# We don't do any networking, but AsyncFd needs the `net` feature for some silly reason
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "process", "sync", "time"] }
+
+[dev-dependencies]
+ntest = "0.9.5"
+tempfile = "3.27.0"
+tokio = { version = "1", features = ["rt"] }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test Quality"
+  short_description: "Write and review contract-focused tests"
+  default_prompt: "Use $test-quality to assess and improve tests within the requested scope, then report every residual verification issue and assessment limitation."

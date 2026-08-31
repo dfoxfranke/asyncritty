@@ -1,0 +1,3 @@
+interface:
+  display_name: "Naming Things"
+  short_description: "Choose clear names that fit local conventions"

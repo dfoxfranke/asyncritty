@@ -1,0 +1,3 @@
+interface:
+  display_name: "Math in Code Comments"
+  short_description: "Format formulas clearly in source comments"

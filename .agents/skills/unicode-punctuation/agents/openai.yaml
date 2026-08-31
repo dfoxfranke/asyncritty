@@ -1,0 +1,3 @@
+interface:
+  display_name: "Unicode Punctuation"
+  short_description: "Use Unicode punctuation safely in docs and comments"
