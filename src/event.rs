@@ -8,7 +8,6 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::future::{Future, ready};
 use std::io;
-use std::process::ExitStatus;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use alacritty_terminal::event::Event as TerminalEvent;
@@ -126,14 +125,6 @@ pub trait EventListener: Send + Sync + 'static {
         ready(Ok(()))
     }
 
-    /// Handle a notification of the child's exit status.
-    fn child_exit(
-        &self,
-        _status: ExitStatus,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        ready(Ok(()))
-    }
-
     /// Handle the outcome of an [`EventLoopHandle::resize`](crate::EventLoopHandle::resize)
     /// request.
     ///
@@ -158,7 +149,7 @@ impl EventListener for VoidListener {
 
 /// One event awaiting asynchronous listener delivery.
 pub(crate) enum Event {
-    /// Terminal-state or child-lifecycle event.
+    /// Terminal-state event.
     Terminal(TerminalEvent),
 
     /// Result of applying one resize request selected by the event loop.
@@ -200,7 +191,9 @@ pub(crate) async fn dispatch_event<L: EventListener + ?Sized>(
             TerminalEvent::Wakeup => listener.wakeup().await,
             TerminalEvent::Bell => listener.bell().await,
             TerminalEvent::Exit => listener.exit().await,
-            TerminalEvent::ChildExit(status) => listener.child_exit(status).await,
+            // Child supervision belongs to the application. Alacritty's enum
+            // includes this variant, but this loop does not produce it.
+            TerminalEvent::ChildExit(_) => Ok(()),
         },
         Event::ResizeResult(result) => listener.resize_result(result).await,
     }
@@ -246,6 +239,7 @@ impl AlacrittyEventListener for SyncEventProxy {
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
 
     use super::*;
 
@@ -287,9 +281,6 @@ mod tests {
 
         /// Terminal application requested shutdown.
         Exit,
-
-        /// Raw child exit status.
-        ChildExit(i32),
 
         /// Applied geometry or resize failure kind.
         ResizeResult(Result<(u16, u16, u16, u16), io::ErrorKind>),
@@ -403,14 +394,6 @@ mod tests {
             ready(Ok(()))
         }
 
-        fn child_exit(
-            &self,
-            status: ExitStatus,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            self.record(Observation::ChildExit(status.into_raw()));
-            ready(Ok(()))
-        }
-
         fn resize_result(
             &self,
             result: io::Result<WindowSize>,
@@ -452,10 +435,10 @@ mod tests {
         assert!(clone.drain().is_empty());
     }
 
-    /// Every internal event transfers its payload to the corresponding typed
-    /// callback.
+    /// Terminal events transfer their payloads to the corresponding callbacks;
+    /// child-exit events are ignored.
     #[tokio::test]
-    async fn dispatches_every_event_to_its_callback() {
+    async fn dispatches_terminal_events_and_ignores_child_exit() {
         let listener = RecordingListener::default();
         let events = [
             TerminalEvent::MouseCursorDirty.into(),
@@ -516,7 +499,6 @@ mod tests {
                 Observation::Wakeup,
                 Observation::Bell,
                 Observation::Exit,
-                Observation::ChildExit(7 << 8),
                 Observation::ResizeResult(Ok((31, 97, 9, 18))),
                 Observation::ResizeResult(Err(io::ErrorKind::PermissionDenied)),
             ]

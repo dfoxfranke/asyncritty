@@ -71,11 +71,6 @@ impl PtyOutput {
             }
         }
     }
-
-    /// Borrow the controller descriptor for output-side kernel probes.
-    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
-        self.inner.get_ref().as_fd()
-    }
 }
 
 impl AsRawFd for PtyOutput {
@@ -198,12 +193,6 @@ impl PtyControl {
     /// Return the size last successfully applied through this crate.
     pub(crate) fn recorded_window_size(&self) -> WindowSize {
         self.window_size
-    }
-
-    /// Borrow the controller descriptor for control-side kernel probes.
-    #[cfg(target_os = "dragonfly")]
-    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
-        self.inner.get_ref().as_fd()
     }
 }
 

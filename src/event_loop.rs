@@ -10,7 +10,6 @@ use std::future::{pending, poll_fn};
 use std::io;
 
 use alacritty_terminal::Term;
-use alacritty_terminal::event::Event as TerminalEvent;
 use alacritty_terminal::term;
 use alacritty_terminal::vte::ansi;
 use tokio::io::ReadBuf;
@@ -19,7 +18,6 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::WindowSize;
 use crate::event::{Event, EventListener, SyncEventProxy, dispatch_event};
-use crate::process::Child;
 use crate::terminal::{self, SharedTerminal};
 use crate::tty::{PtyControl, PtyOutput};
 
@@ -186,7 +184,7 @@ impl EventLoopHandle {
     /// events. An error from that callback is returned by [`EventLoop::run`].
     /// A callback that stays pending prevents shutdown from completing.
     ///
-    /// Await [`EventLoop::run`] to recover the child and PTY handles, or
+    /// Await [`EventLoop::run`] to recover the PTY output and control handles, or
     /// [`wait_for_shutdown`](Self::wait_for_shutdown) to observe that the loop
     /// has stopped.
     ///
@@ -215,9 +213,9 @@ impl EventLoopHandle {
 /// The I/O or listener error that stopped [`EventLoop::run`].
 #[derive(Debug)]
 pub enum EventLoopError<E: Error + Send + Sync + 'static> {
-    /// Reading PTY output, checking PTY closure, or waiting for the child failed.
+    /// Reading PTY output failed.
     Io(
-        /// Underlying operating-system or process error.
+        /// Underlying operating-system error.
         io::Error,
     ),
 
@@ -252,16 +250,13 @@ impl<E: Error + Send + Sync + 'static> From<io::Error> for EventLoopError<E> {
     }
 }
 
-/// An [`EventLoop::run`] error together with the child and PTY handles it owned.
+/// An [`EventLoop::run`] error together with the PTY handles it owned.
 ///
-/// The returned handles remain available for process cleanup or further PTY I/O.
+/// The returned handles remain available for further PTY I/O.
 #[derive(Debug)]
 pub struct EventLoopFailure<E: Error + Send + Sync + 'static> {
     /// Failure that stopped the loop.
     pub error: EventLoopError<E>,
-
-    /// Child process released by the stopped loop.
-    pub child: Child,
 
     /// PTY output handle released by the stopped loop.
     pub output: PtyOutput,
@@ -282,7 +277,7 @@ impl<E: Error + Send + Sync + 'static> Error for EventLoopFailure<E> {
     }
 }
 
-/// Reads a child's PTY output into an Alacritty [`Term`] and delivers terminal
+/// Reads PTY output into an Alacritty [`Term`] and delivers terminal
 /// events to an asynchronous [`EventListener`].
 ///
 /// Call [`run`](Self::run) to drive the loop. Use the [`EventLoopHandle`]
@@ -298,9 +293,6 @@ pub struct EventLoop<L: EventListener> {
 
     /// Heap storage preserves `EventLoop<L>: Unpin` independently of `L`.
     listener: Box<L>,
-
-    /// Child whose exit may be reported to the listener.
-    child: Child,
 
     /// PTY output read by the event loop.
     output: PtyOutput,
@@ -322,8 +314,9 @@ pub struct EventLoop<L: EventListener> {
 }
 
 impl<L: EventListener> EventLoop<L> {
-    /// Create a terminal model and event loop from the child, output, and control
-    /// fields of a [`Pty`](crate::Pty).
+    /// Create a terminal model and event loop from the output and control fields
+    /// of a [`Pty`](crate::Pty). The caller retains its child and manages process
+    /// waiting and signaling independently.
     ///
     /// `terminal_config` configures the Alacritty terminal model. Its initial
     /// size is the window size most recently applied through `pty_control`.
@@ -336,7 +329,6 @@ impl<L: EventListener> EventLoop<L> {
     /// Panics if `pty_control`'s recorded window size has no lines or
     /// fewer than two columns.
     pub fn new<F>(
-        child: Child,
         output: PtyOutput,
         pty_control: PtyControl,
         terminal_config: term::Config,
@@ -359,7 +351,6 @@ impl<L: EventListener> EventLoop<L> {
             terminal,
             terminal_events,
             listener,
-            child,
             output,
             pty_control,
             resizes,
@@ -374,15 +365,14 @@ impl<L: EventListener> EventLoop<L> {
     /// Process PTY output and listener events until shutdown, PTY EOF, or an
     /// error.
     ///
-    /// On success, returns the child, PTY output, and PTY control handles. Call
-    /// [`Child::wait`] on the returned child to collect its exit status.
+    /// On success, returns the PTY output and control handles. The loop never
+    /// owns, waits for, or signals the independently managed child.
     ///
     /// PTY EOF completes the loop normally. The `EIO` error used for slave
     /// closure on Linux is also treated as EOF. At EOF, the loop applies any
     /// buffered synchronized update and delivers its events before returning.
     /// Child exit alone does not stop the loop: descendants may still hold the
-    /// slave open. The loop can report the exit through
-    /// [`EventListener::child_exit`] while continuing to process PTY output.
+    /// slave open.
     ///
     /// Events are delivered serially in emission order. Each callback completes
     /// before the loop reads more PTY output or processes a resize. The terminal
@@ -394,17 +384,24 @@ impl<L: EventListener> EventLoop<L> {
     ///
     /// # Cancellation
     ///
-    /// Dropping this future drops the child, output, control, listener, and any
-    /// active callback future. Dropping the child follows
-    /// [`Command::kill_on_drop`](crate::Command::kill_on_drop). Use
-    /// [`EventLoopHandle::shutdown`] and await this future to recover the child
-    /// and PTY handles instead.
+    /// Dropping this future stops processing and cancels any active listener
+    /// callback without waiting for it to finish. Queued events and output
+    /// buffered by the parser are discarded. Already-applied model updates
+    /// remain accessible through [`EventLoopHandle::terminal`].
+    ///
+    /// Cancellation drops the listener and the loop's PTY output and control
+    /// handles. If no other handles keep the PTY master open, it closes, which
+    /// can cause a terminal hangup.
+    ///
+    /// To let the active callback finish and recover the PTY handles, call
+    /// [`EventLoopHandle::shutdown`] and continue awaiting this future. Shutdown
+    /// cannot complete while that callback remains pending.
     ///
     /// # Errors
     ///
-    /// PTY read, PTY closure check, and child-wait errors stop the loop. The first
+    /// PTY read errors stop the loop. The first
     /// listener callback error also stops the loop, discarding queued events.
-    /// [`EventLoopFailure`] retains the child and PTY output and control handles
+    /// [`EventLoopFailure`] retains the PTY output and control handles
     /// along with the error.
     ///
     /// # Panics
@@ -412,12 +409,9 @@ impl<L: EventListener> EventLoop<L> {
     /// May panic when first polled outside a Tokio runtime. May also panic if
     /// parsed output starts a synchronized update while the runtime has no time
     /// driver.
-    pub async fn run(
-        mut self,
-    ) -> Result<(Child, PtyOutput, PtyControl), EventLoopFailure<L::Error>> {
+    pub async fn run(mut self) -> Result<(PtyOutput, PtyControl), EventLoopFailure<L::Error>> {
         let mut parser: ansi::Processor = ansi::Processor::new();
         let mut read_buffer = vec![0; READ_BUFFER_SIZE];
-        let mut child_reaped = false;
 
         let result = loop {
             if !self.stop_on_drop.0.is_running() {
@@ -431,7 +425,6 @@ impl<L: EventListener> EventLoop<L> {
                     resize.expect("the event loop retains a resize sender");
                     LoopAction::Resize(*self.resizes.borrow_and_update())
                 },
-                status = self.child.wait(), if !child_reaped => LoopAction::Child(status),
                 _ = wait_for_deadline(sync_deadline) => LoopAction::SyncTimeout,
                 result = read_once(&self.output, &mut read_buffer) => LoopAction::Read(result),
             };
@@ -444,32 +437,6 @@ impl<L: EventListener> EventLoop<L> {
                         break Err(error);
                     }
                 }
-                LoopAction::Child(status) => match status {
-                    Ok(status) => {
-                        child_reaped = true;
-
-                        // Suppress ChildExit when the final slave has already closed: routine
-                        // termination of its holder is represented by PTY EOF, while an exited
-                        // child whose terminal remains alive is reported separately. Probe the
-                        // kernel synchronously because reactor readiness can lag behind the
-                        // child notification.
-                        let slave_closed =
-                            match probe_slave_closure(&self.output, &self.pty_control) {
-                                Ok(slave_closed) => slave_closed,
-                                Err(error) => break Err(error.into()),
-                            };
-                        if slave_closed {
-                            continue;
-                        }
-
-                        let events =
-                            VecDeque::from([Event::from(TerminalEvent::ChildExit(status))]);
-                        if let Err(error) = self.deliver_events(events).await {
-                            break Err(error);
-                        }
-                    }
-                    Err(error) => break Err(error.into()),
-                },
                 LoopAction::SyncTimeout => {
                     let (_, events) = self
                         .terminal
@@ -578,11 +545,11 @@ impl<L: EventListener> EventLoop<L> {
         Ok(())
     }
 
-    /// Return the child and PTY capabilities alongside the loop outcome.
+    /// Return the PTY capabilities alongside the loop outcome.
     ///
     /// # Errors
     ///
-    /// Returns the loop error together with the child and PTY capabilities.
+    /// Returns the loop error together with the PTY capabilities.
     #[allow(
         clippy::result_large_err,
         reason = "both completion paths return the same owned capabilities"
@@ -590,15 +557,13 @@ impl<L: EventListener> EventLoop<L> {
     fn complete(
         self,
         result: Result<(), EventLoopError<L::Error>>,
-    ) -> Result<(Child, PtyOutput, PtyControl), EventLoopFailure<L::Error>> {
-        let child = self.child;
+    ) -> Result<(PtyOutput, PtyControl), EventLoopFailure<L::Error>> {
         let output = self.output;
         let control = self.pty_control;
         match result {
-            Ok(()) => Ok((child, output, control)),
+            Ok(()) => Ok((output, control)),
             Err(error) => Err(EventLoopFailure {
                 error,
-                child,
                 output,
                 control,
             }),
@@ -613,9 +578,6 @@ enum LoopAction {
 
     /// Latest resize claimed for processing.
     Resize(WindowSize),
-
-    /// Result of waiting for the child once.
-    Child(io::Result<std::process::ExitStatus>),
 
     /// A synchronized-update deadline elapsed.
     SyncTimeout,
@@ -677,73 +639,6 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
 /// Return whether Linux reported its PTY-slave-closure form of EOF.
 fn is_linux_pty_eio(error: &io::Error) -> bool {
     cfg!(target_os = "linux") && error.raw_os_error() == Some(libc::EIO)
-}
-
-/// Probe the kernel synchronously for closure of the PTY slave side.
-///
-/// # Errors
-///
-/// Returns an error if polling or querying the controller descriptor fails.
-fn probe_slave_closure(output: &PtyOutput, control: &PtyControl) -> io::Result<bool> {
-    if poll_master_hangup(output)? {
-        return Ok(true);
-    }
-
-    // DragonFly can make the child waitable before publishing HUP. TIOCGWINSZ
-    // returns EAGAIN once its final slave closes, without consuming pending output.
-    #[cfg(target_os = "dragonfly")]
-    let slave_closed = probe_dragonfly_slave_closure(control)?;
-    #[cfg(not(target_os = "dragonfly"))]
-    let slave_closed = {
-        let _ = control;
-        false
-    };
-
-    Ok(slave_closed)
-}
-
-/// Poll the kernel directly for closure of the PTY slave side.
-///
-/// # Errors
-///
-/// Returns an error if polling the controller descriptor fails or reports that
-/// the descriptor is invalid.
-fn poll_master_hangup(output: &PtyOutput) -> io::Result<bool> {
-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
-
-    let mut descriptor = [PollFd::from_borrowed_fd(output.fd(), PollFlags::empty())];
-    let no_wait = Timespec::default();
-    loop {
-        descriptor[0].clear_revents();
-        match poll(&mut descriptor, Some(&no_wait)) {
-            Ok(_) => {
-                let events = descriptor[0].revents();
-                if events.contains(PollFlags::NVAL) {
-                    return Err(io::Error::from_raw_os_error(libc::EBADF));
-                }
-                return Ok(events.contains(PollFlags::HUP));
-            }
-            Err(rustix::io::Errno::INTR) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
-/// Probe DragonFly's pre-HUP window for closure of the PTY slave side.
-///
-/// # Errors
-///
-/// Returns an error if querying the controller descriptor fails for a reason
-/// other than the expected final-slave `EAGAIN` indication.
-#[cfg(target_os = "dragonfly")]
-fn probe_dragonfly_slave_closure(control: &PtyControl) -> io::Result<bool> {
-    use rustix::io::{Errno, retry_on_intr};
-
-    match retry_on_intr(|| rustix::termios::tcgetwinsize(control.fd())) {
-        Ok(_) => Ok(false),
-        Err(Errno::AGAIN) => Ok(true),
-        Err(error) => Err(error.into()),
-    }
 }
 
 /// Unit coverage for resize validation and lifecycle reporting.

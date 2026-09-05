@@ -198,16 +198,15 @@ async fn from_fds_initial_geometry() {
     drop(observed_slave);
 
     let Pty {
-        child,
+        mut child,
         output,
         control,
         input: _input,
         ..
     } = pty;
-    let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), |_| {
-            asyncritty::VoidListener
-        });
+    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
+        asyncritty::VoidListener
+    });
     let terminal_size = {
         let terminal = handle.terminal().await;
         (terminal.screen_lines(), terminal.columns())
@@ -221,7 +220,7 @@ async fn from_fds_initial_geometry() {
     );
 
     handle.shutdown();
-    let (mut child, _output, _control) = event_loop.run().await.unwrap();
+    let (_output, _control) = event_loop.run().await.unwrap();
     stop_child(&mut child).await;
     child_guard.disarm();
 }
@@ -257,16 +256,15 @@ async fn event_loop_uses_resized_control_geometry() {
     assert_kernel_window_size(&observed_slave, resized);
 
     let Pty {
-        child,
+        mut child,
         output,
         control,
         input: _input,
         ..
     } = pty;
-    let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), |_| {
-            asyncritty::VoidListener
-        });
+    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
+        asyncritty::VoidListener
+    });
     let terminal_size = {
         let terminal = handle.terminal().await;
         (terminal.screen_lines(), terminal.columns())
@@ -274,7 +272,7 @@ async fn event_loop_uses_resized_control_geometry() {
     assert_eq!(terminal_size, (31, 97));
 
     handle.shutdown();
-    let (mut child, _output, _control) = event_loop.run().await.unwrap();
+    let (_output, _control) = event_loop.run().await.unwrap();
     stop_child(&mut child).await;
     child_guard.disarm();
 }
@@ -380,17 +378,16 @@ async fn input_is_independent_of_event_loop_lifetime() {
 
     pty.input.write_all(b"before-loop\n").await.unwrap();
     let Pty {
-        child,
+        mut child,
         output,
         control,
         mut input,
         ..
     } = pty;
     let (titles_tx, mut titles_rx) = mpsc::channel(1);
-    let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), move |_| {
-            TitleListener { titles: titles_tx }
-        });
+    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), move |_| {
+        TitleListener { titles: titles_tx }
+    });
     let task = tokio::spawn(event_loop.run());
 
     let title = titles_rx
@@ -399,7 +396,7 @@ async fn input_is_independent_of_event_loop_lifetime() {
         .expect("the running event loop retains the title sender");
     assert_eq!(title, "before-loop");
     handle.shutdown();
-    let (mut child, _output, _control) = task.await.unwrap().unwrap();
+    let (_output, _control) = task.await.unwrap().unwrap();
 
     input.write_all(b"after-loop\n").await.unwrap();
     wait_for_path(&after_marker).await;
@@ -503,19 +500,18 @@ async fn terminal_observation_coalesces_pty_wakeups() {
     .unwrap();
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         mut input,
         ..
     } = pty;
     let (observations_tx, mut observations_rx) = mpsc::unbounded_channel();
-    let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), move |_| {
-            RecordingListener {
-                observations: observations_tx,
-            }
-        });
+    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), move |_| {
+        RecordingListener {
+            observations: observations_tx,
+        }
+    });
     let task = tokio::spawn(event_loop.run());
 
     assert_eq!(
@@ -567,7 +563,7 @@ async fn terminal_observation_coalesces_pty_wakeups() {
     );
 
     handle.shutdown();
-    let (mut child, _output, _control) = task.await.unwrap().unwrap();
+    let (_output, _control) = task.await.unwrap().unwrap();
     stop_child(&mut child).await;
     child_guard.disarm();
 }
@@ -587,13 +583,12 @@ async fn slave_eof_returns_capabilities_and_stops_handle() {
         control,
         input,
     } = pty;
-    let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), |_| {
-            asyncritty::VoidListener
-        });
+    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
+        asyncritty::VoidListener
+    });
     let task = tokio::spawn(event_loop.run());
 
-    let (child, output, control) = task
+    let (output, control) = task
         .await
         .unwrap()
         .expect("slave EOF is a normal event-loop completion condition");
@@ -631,28 +626,25 @@ async fn slave_eof_flushes_synchronized_update() {
     .unwrap();
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         input: _input,
         ..
     } = pty;
     let (observations_tx, mut observations_rx) = mpsc::unbounded_channel();
-    let (event_loop, handle) = EventLoop::new(
-        child,
-        output,
-        control,
-        TermConfig::default(),
-        move |handle| ReobservingRecordingListener {
-            observations: observations_tx,
-            handle,
-        },
-    );
+    let (event_loop, handle) =
+        EventLoop::new(output, control, TermConfig::default(), move |handle| {
+            ReobservingRecordingListener {
+                observations: observations_tx,
+                handle,
+            }
+        });
     {
         let _terminal = handle.terminal().await;
     }
 
-    let (mut child, _output, _control) = event_loop.run().await.unwrap();
+    let (_output, _control) = event_loop.run().await.unwrap();
     let mut observations = Vec::new();
     while let Some(observation) = observations_rx.recv().await {
         observations.push(observation);
@@ -693,7 +685,7 @@ async fn resize_updates_pty_and_terminal() {
     .unwrap();
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         input: _input,
@@ -701,13 +693,12 @@ async fn resize_updates_pty_and_terminal() {
     } = pty;
     let (results_tx, mut results_rx) = mpsc::unbounded_channel();
     let (wakeups_tx, mut wakeups_rx) = mpsc::unbounded_channel();
-    let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), move |_| {
-            ResizeResultListener {
-                results: results_tx,
-                wakeups: wakeups_tx,
-            }
-        });
+    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), move |_| {
+        ResizeResultListener {
+            results: results_tx,
+            wakeups: wakeups_tx,
+        }
+    });
     let task = tokio::spawn(event_loop.run());
     let initially_unobserved = WindowSize {
         num_lines: 40,
@@ -777,14 +768,14 @@ async fn resize_updates_pty_and_terminal() {
     );
 
     handle.shutdown();
-    let (child, output, control) = task.await.unwrap().unwrap();
+    let (output, control) = task.await.unwrap().unwrap();
     let final_logical_size = {
         let terminal = handle.terminal().await;
         (terminal.screen_lines(), terminal.columns())
     };
     assert_eq!(final_logical_size, (42, 122));
     let (next_event_loop, next_handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), |_| {
+        EventLoop::new(output, control, TermConfig::default(), |_| {
             asyncritty::VoidListener
         });
     let next_terminal_size = {
@@ -794,7 +785,7 @@ async fn resize_updates_pty_and_terminal() {
     assert_eq!(next_terminal_size, (42, 122));
 
     next_handle.shutdown();
-    let (mut child, _output, _control) = next_event_loop.run().await.unwrap();
+    let (_output, _control) = next_event_loop.run().await.unwrap();
     stop_child(&mut child).await;
     child_guard.disarm();
 }
@@ -808,7 +799,7 @@ async fn invalid_resize_panics_before_submission() {
     let pty = Pty::spawn(shell("trap '' HUP; exec sleep 30"), initial).unwrap();
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         input: _input,
@@ -816,13 +807,12 @@ async fn invalid_resize_panics_before_submission() {
     } = pty;
     let (results_tx, mut results_rx) = mpsc::unbounded_channel();
     let (wakeups_tx, _wakeups_rx) = mpsc::unbounded_channel();
-    let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), move |_| {
-            ResizeResultListener {
-                results: results_tx,
-                wakeups: wakeups_tx,
-            }
-        });
+    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), move |_| {
+        ResizeResultListener {
+            results: results_tx,
+            wakeups: wakeups_tx,
+        }
+    });
     let task = tokio::spawn(event_loop.run());
 
     for invalid in [
@@ -866,7 +856,7 @@ async fn invalid_resize_panics_before_submission() {
     assert_window_size_eq(applied, minimum);
 
     handle.shutdown();
-    let (mut child, _output, _control) = task.await.unwrap().unwrap();
+    let (_output, _control) = task.await.unwrap().unwrap();
     stop_child(&mut child).await;
     child_guard.disarm();
 }
@@ -956,7 +946,7 @@ async fn final_master_owner_controls_hangup() {
     let original_child = pty.child.id();
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         mut input,
@@ -964,17 +954,15 @@ async fn final_master_owner_controls_hangup() {
     } = pty;
     let ready = Arc::new(Notify::new());
     let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), |_| {
-            ReadyListener {
-                ready: Arc::clone(&ready),
-            }
+        EventLoop::new(output, control, TermConfig::default(), |_| ReadyListener {
+            ready: Arc::clone(&ready),
         });
     let task = tokio::spawn(event_loop.run());
 
     ready.notified().await;
     handle.shutdown();
     handle.shutdown();
-    let (mut child, output, control) = task.await.unwrap().unwrap();
+    let (output, control) = task.await.unwrap().unwrap();
 
     handle.wait_for_shutdown().await;
     handle.shutdown();
@@ -1100,10 +1088,9 @@ async fn listener_failure_retains_capabilities() {
         control,
         input,
     } = pty;
-    let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), |_| {
-            FailingTitleListener
-        });
+    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
+        FailingTitleListener
+    });
 
     let failure = event_loop.run().await.unwrap_err();
     handle.wait_for_shutdown().await;
@@ -1128,7 +1115,7 @@ async fn listener_failure_retains_capabilities() {
 
     let mut pty = Pty {
         name,
-        child: failure.child,
+        child,
         output: failure.output,
         control: failure.control,
         input,
@@ -1164,12 +1151,13 @@ async fn abort_retains_independent_input() {
          cat >/dev/null",
     );
     command
+        .kill_on_drop(true)
         .env("ASYNCRITTY_CLOSED_MARKER", &closed_marker)
         .env("ASYNCRITTY_INPUT_MARKER", &input_marker);
     let pty = Pty::spawn(command, window_size()).unwrap();
-    let _child_guard = ChildProcessGuard::for_pty(&pty);
+    let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         mut input,
@@ -1177,13 +1165,12 @@ async fn abort_retains_independent_input() {
     } = pty;
     let callback_entered = Arc::new(Notify::new());
     let callback_dropped = Arc::new(Notify::new());
-    let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), |_| {
-            PendingReadyListener {
-                entered: Arc::clone(&callback_entered),
-                dropped: Arc::clone(&callback_dropped),
-            }
-        });
+    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
+        PendingReadyListener {
+            entered: Arc::clone(&callback_entered),
+            dropped: Arc::clone(&callback_dropped),
+        }
+    });
     let task = tokio::spawn(event_loop.run());
 
     callback_entered.notified().await;
@@ -1192,6 +1179,10 @@ async fn abort_retains_independent_input() {
     assert!(join_error.is_cancelled());
     callback_dropped.notified().await;
     handle.wait_for_shutdown().await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "aborting the loop must retain the independently owned child"
+    );
     input.write_all(b"input-open\n").await.unwrap();
     wait_for_path(&input_marker).await;
     assert!(
@@ -1201,4 +1192,7 @@ async fn abort_retains_independent_input() {
 
     drop(input);
     wait_for_path(&closed_marker).await;
+    let status = child.wait().await.unwrap();
+    child_guard.disarm();
+    assert!(status.success());
 }

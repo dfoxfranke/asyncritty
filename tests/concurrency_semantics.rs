@@ -10,7 +10,6 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
-use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
@@ -113,7 +112,7 @@ async fn listener_backpressure_does_not_block_direct_input() {
     let pty = Pty::spawn(command, window_size()).unwrap();
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         mut input,
@@ -126,9 +125,7 @@ async fn listener_backpressure_does_not_block_direct_input() {
         release_first: Arc::clone(&release_first),
     };
     let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), move |_| {
-            listener
-        });
+        EventLoop::new(output, control, TermConfig::default(), move |_| listener);
     let task = tokio::spawn(event_loop.run());
 
     let first = titles_rx
@@ -152,7 +149,7 @@ async fn listener_backpressure_does_not_block_direct_input() {
     assert_eq!(second, "second");
 
     handle.shutdown();
-    let (mut child, _output, _control) = task.await.unwrap().unwrap();
+    let (_output, _control) = task.await.unwrap().unwrap();
     stop_child(&mut child).await;
     child_guard.disarm();
 }
@@ -242,7 +239,7 @@ async fn listener_resizes_are_coalesced_and_reported_as_events() {
     .unwrap();
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         input: _input,
@@ -278,20 +275,17 @@ async fn listener_resizes_are_coalesced_and_reported_as_events() {
     let (title_pending_tx, mut title_pending_rx) = mpsc::unbounded_channel();
     let release_title = Arc::new(Notify::new());
     let listener_release_title = Arc::clone(&release_title);
-    let (event_loop, handle) = EventLoop::new(
-        child,
-        output,
-        control,
-        TermConfig::default(),
-        move |handle| CoalescingResizeListener {
-            handle,
-            initial_requests,
-            follow_up,
-            completions: completions_tx,
-            title_pending: title_pending_tx,
-            release_title: listener_release_title,
-        },
-    );
+    let (event_loop, handle) =
+        EventLoop::new(output, control, TermConfig::default(), move |handle| {
+            CoalescingResizeListener {
+                handle,
+                initial_requests,
+                follow_up,
+                completions: completions_tx,
+                title_pending: title_pending_tx,
+                release_title: listener_release_title,
+            }
+        });
     let run = event_loop.run();
     tokio::pin!(run);
     tokio::select! {
@@ -309,7 +303,7 @@ async fn listener_resizes_are_coalesced_and_reported_as_events() {
     .await;
     release_title.notify_one();
 
-    let (mut child, _output, _control) = run.as_mut().await.unwrap();
+    let (_output, _control) = run.as_mut().await.unwrap();
     handle.wait_for_shutdown().await;
 
     let mut completions = Vec::new();
@@ -439,7 +433,7 @@ async fn listener_can_drop_best_effort_replies() {
     let pty = Pty::spawn(command, window_size()).unwrap();
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         input,
@@ -448,13 +442,12 @@ async fn listener_can_drop_best_effort_replies() {
     let input = Arc::new(Mutex::new(input));
     let (reports_tx, mut reports_rx) = mpsc::unbounded_channel();
     let listener_input = Arc::clone(&input);
-    let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), move |_| {
-            DsrListener {
-                input: listener_input,
-                reports: reports_tx,
-            }
-        });
+    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), move |_| {
+        DsrListener {
+            input: listener_input,
+            reports: reports_tx,
+        }
+    });
     let task = tokio::spawn(event_loop.run());
 
     let first = reports_rx
@@ -502,81 +495,59 @@ async fn listener_can_drop_best_effort_replies() {
     let _ = writer.await;
 
     handle.shutdown();
-    let (mut child, _output, _control) = task.await.unwrap().unwrap();
+    let (_output, _control) = task.await.unwrap().unwrap();
     stop_child(&mut child).await;
     child_guard.disarm();
 }
 
-/// Forwards the first reported child status to the observing test task.
-#[derive(Clone)]
-struct ChildExitListener {
-    /// Channel receiving child-exit statuses.
-    statuses: mpsc::Sender<ExitStatus>,
-}
-
-impl EventListener for ChildExitListener {
-    type Error = Infallible;
-
-    async fn child_exit(&self, status: ExitStatus) -> Result<(), Self::Error> {
-        let _ = self.statuses.send(status).await;
-        Ok(())
-    }
-}
-
-/// Child exit is reported once while a descendant keeps the slave open,
-/// without changing the event loop's running state.
+/// Independently reaping the child leaves PTY processing active until its descendant exits.
 #[tokio::test(flavor = "current_thread")]
 #[ntest::timeout(15_000)]
 async fn child_exit_does_not_stop_event_loop() {
-    let pty = Pty::spawn(shell("trap '' HUP; sleep 30 & exit 7"), window_size()).unwrap();
-    let _child_guard = ChildProcessGuard::for_pty(&pty);
+    let pty = Pty::spawn(
+        shell("trap '' HUP; { IFS= read -r line; printf 'descendant:%s' \"$line\"; } <&0 & exit 7"),
+        window_size(),
+    )
+    .unwrap();
+    let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
-        input: _input,
+        mut input,
         ..
     } = pty;
-    let (statuses_tx, mut statuses_rx) = mpsc::channel(2);
-    let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), move |_| {
-            ChildExitListener {
-                statuses: statuses_tx,
-            }
-        });
+    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
+        asyncritty::VoidListener
+    });
     let task = tokio::spawn(event_loop.run());
 
-    let status = statuses_rx
-        .recv()
-        .await
-        .expect("the running event loop owns the child-exit sender");
+    let status = child.wait().await.unwrap();
+    // The group leader has been reaped, so cleanup must not address its reusable ID.
+    // Dropping the PTY on failure closes the descendant's blocked read instead.
+    child_guard.disarm();
     assert_eq!(status.code(), Some(7));
-    tokio::task::yield_now().await;
     assert!(
         !task.is_finished(),
-        "the event loop should remain running after child exit",
+        "the descendant still holds the terminal open"
     );
     let shutdown_wait = handle.wait_for_shutdown();
     tokio::pin!(shutdown_wait);
-    assert!(
-        matches!(poll_once(shutdown_wait.as_mut()), Poll::Pending),
-        "the shutdown wait should remain pending after child exit",
-    );
-    assert!(matches!(
-        statuses_rx.try_recv(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
+    assert!(matches!(poll_once(shutdown_wait.as_mut()), Poll::Pending));
 
-    handle.shutdown();
-    let (mut child, _output, _control) = task.await.unwrap().unwrap();
-    shutdown_wait.as_mut().await;
-    assert!(
-        statuses_rx.recv().await.is_none(),
-        "the listener should receive at most one child-exit callback",
+    input.write_all(b"done\n").await.unwrap();
+    let (_output, _control) = task.await.unwrap().unwrap();
+    shutdown_wait.await;
+    let terminal = handle.terminal().await;
+    let screen = terminal.bounds_to_string(
+        asyncritty::alacritty_terminal::index::Point::default(),
+        asyncritty::alacritty_terminal::index::Point::new(
+            terminal.bottommost_line(),
+            terminal.last_column(),
+        ),
     );
-    assert_eq!(child.wait().await.unwrap().code(), Some(7),);
-    handle.shutdown();
-    handle.wait_for_shutdown().await;
+    assert!(screen.contains("descendant:done"));
+    assert_eq!(child.wait().await.unwrap().code(), Some(7));
 }
 
 /// Accepts events without adding behavior to lifecycle tests.
@@ -590,19 +561,19 @@ impl EventListener for PassiveListener {
 /// ready.
 #[tokio::test(flavor = "current_thread")]
 async fn dropping_unrun_event_loop_completes_shutdown_wait() {
-    let pty = Pty::spawn(shell("trap '' HUP; exec sleep 30"), window_size()).unwrap();
-    let _child_guard = ChildProcessGuard::for_pty(&pty);
+    let mut command = shell("trap '' HUP; exec sleep 30");
+    command.kill_on_drop(true);
+    let pty = Pty::spawn(command, window_size()).unwrap();
+    let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         input: _input,
         ..
     } = pty;
     let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), |_| {
-            PassiveListener
-        });
+        EventLoop::new(output, control, TermConfig::default(), |_| PassiveListener);
     let shutdown_wait = handle.wait_for_shutdown();
     tokio::pin!(shutdown_wait);
 
@@ -613,6 +584,12 @@ async fn dropping_unrun_event_loop_completes_shutdown_wait() {
     let late_wait = handle.wait_for_shutdown();
     tokio::pin!(late_wait);
     assert!(matches!(poll_once(late_wait.as_mut()), Poll::Ready(())));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "dropping an unrun loop must retain the independently owned child"
+    );
+    stop_child(&mut child).await;
+    child_guard.disarm();
 }
 
 /// Result produced when a test releases a gated wakeup callback.
@@ -671,7 +648,7 @@ async fn shutdown_waits_for_pending_listener_to_succeed() {
     let pty = Pty::spawn(shell("trap '' HUP; exec sleep 30"), window_size()).unwrap();
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         input: _input,
@@ -687,9 +664,7 @@ async fn shutdown_waits_for_pending_listener_to_succeed() {
         resize_result_delivered: Arc::clone(&resize_result_delivered),
     };
     let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), move |_| {
-            listener
-        });
+        EventLoop::new(output, control, TermConfig::default(), move |_| listener);
     {
         let _terminal = handle.terminal().await;
     }
@@ -721,7 +696,7 @@ async fn shutdown_waits_for_pending_listener_to_succeed() {
     );
 
     release.add_permits(1);
-    let (mut child, _output, _control) = run.as_mut().await.unwrap();
+    let (_output, _control) = run.as_mut().await.unwrap();
     shutdown_wait.as_mut().await;
     assert!(
         !resize_result_delivered.load(Ordering::SeqCst),
@@ -740,7 +715,7 @@ async fn shutdown_reports_pending_listener_failure() {
     let pty = Pty::spawn(shell("trap '' HUP; exec sleep 30"), window_size()).unwrap();
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
-        child,
+        mut child,
         output,
         control,
         input: _input,
@@ -756,9 +731,7 @@ async fn shutdown_reports_pending_listener_failure() {
         resize_result_delivered: Arc::clone(&resize_result_delivered),
     };
     let (event_loop, handle) =
-        EventLoop::new(child, output, control, TermConfig::default(), move |_| {
-            listener
-        });
+        EventLoop::new(output, control, TermConfig::default(), move |_| listener);
     {
         let _terminal = handle.terminal().await;
     }
@@ -794,7 +767,6 @@ async fn shutdown_reports_pending_listener_failure() {
         "shutdown should discard the resize result queued behind the wakeup",
     );
 
-    let mut child = failure.child;
     stop_child(&mut child).await;
     child_guard.disarm();
 }

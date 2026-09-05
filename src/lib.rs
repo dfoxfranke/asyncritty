@@ -5,9 +5,10 @@
 //! [`alacritty_terminal::Term`], using Tokio for asynchronous I/O.
 //!
 //! [`Pty::spawn`] starts a [`Command`] with its standard streams attached to the
-//! terminal. Pass the resulting child, output, and control handles to
-//! [`EventLoop::new`], then drive the terminal with [`EventLoop::run`]. The
-//! application keeps [`PtyInput`] for writing keystrokes and terminal replies.
+//! terminal. Pass its output and control handles to [`EventLoop::new`], then
+//! drive the terminal with [`EventLoop::run`]. The application retains [`Child`]
+//! for independent waiting and signaling, and [`PtyInput`] for keystrokes and
+//! terminal replies.
 //!
 //! [`EventLoopHandle`] provides access to the terminal state for rendering,
 //! along with resize and shutdown requests. Implement [`EventListener`] to
@@ -36,13 +37,14 @@
 //!         cell_width: 8,
 //!         cell_height: 16,
 //!     };
-//!     let Pty { child, output, control, input: _input, .. } = Pty::spawn(command, size)?;
+//!     let Pty { mut child, output, control, input: _input, .. } = Pty::spawn(command, size)?;
 //!     let (event_loop, handle) = EventLoop::new(
-//!         child, output, control, Default::default(), |_| VoidListener,
+//!         output, control, Default::default(), |_| VoidListener,
 //!     );
 //!
-//!     let (mut child, _output, _control) = event_loop.run().await?;
-//!     let status = child.wait().await?;
+//!     let (loop_result, status) = tokio::join!(event_loop.run(), child.wait());
+//!     let (_output, _control) = loop_result?;
+//!     let status = status?;
 //!     let terminal = handle.terminal().await;
 //!     let screen = terminal.bounds_to_string(
 //!         Point::default(),
