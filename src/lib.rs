@@ -74,4 +74,5 @@ pub use alacritty_terminal::{
 pub use event::{EventListener, SyncEventProxy, VoidListener};
 pub use event_loop::{EventLoop, EventLoopError, EventLoopFailure, EventLoopHandle};
 pub use process::{Child, Command};
+pub use terminal::TerminalReadGuard;
 pub use tty::{Pty, PtyControl, PtyInput, PtyOutput};

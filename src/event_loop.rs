@@ -9,16 +9,15 @@ use std::fmt::{self, Display, Formatter};
 use std::future::{pending, poll_fn};
 use std::io;
 
-use alacritty_terminal::Term;
 use alacritty_terminal::term;
 use alacritty_terminal::vte::ansi;
 use tokio::io::ReadBuf;
-use tokio::sync::{RwLockReadGuard, watch};
+use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 
 use crate::WindowSize;
 use crate::event::{Event, EventListener, SyncEventProxy, dispatch_event};
-use crate::terminal::{self, SharedTerminal};
+use crate::terminal::{self, SharedTerminal, TerminalReadGuard};
 use crate::tty::{PtyControl, PtyOutput};
 
 /// Maximum bytes read from the PTY in one parser batch.
@@ -139,8 +138,10 @@ impl EventLoopHandle {
     ///
     /// Acquiring the guard marks the state as observed, enabling the next
     /// [`EventListener::wakeup`] notification. After the loop stops, the guard
-    /// gives access to the final terminal state.
-    pub async fn terminal(&self) -> RwLockReadGuard<'_, Term<SyncEventProxy>> {
+    /// gives access to the final terminal state. Use
+    /// [`TerminalReadGuard::changed`] to check whether this acquisition
+    /// acknowledged a previously unobserved update.
+    pub async fn terminal(&self) -> TerminalReadGuard<'_> {
         self.terminal.read().await
     }
 
@@ -277,8 +278,8 @@ impl<E: Error + Send + Sync + 'static> Error for EventLoopFailure<E> {
     }
 }
 
-/// Reads PTY output into an Alacritty [`Term`] and delivers terminal
-/// events to an asynchronous [`EventListener`].
+/// Reads PTY output into an Alacritty [`Term`](alacritty_terminal::Term) and
+/// delivers terminal events to an asynchronous [`EventListener`].
 ///
 /// Call [`run`](Self::run) to drive the loop. Use the [`EventLoopHandle`]
 /// returned by [`new`](Self::new) to inspect terminal state, resize the terminal,

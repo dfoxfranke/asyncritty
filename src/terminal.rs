@@ -4,6 +4,7 @@
 //! Shared ownership of Alacritty's terminal state machine.
 
 use std::collections::VecDeque;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -64,16 +65,47 @@ struct SharedTerminalInner {
     observed: AtomicBool,
 }
 
+/// A read lock on the terminal model and its observation status at acquisition.
+///
+/// Obtained from [`EventLoopHandle::terminal`](crate::EventLoopHandle::terminal).
+/// The guard may be held across `.await` points. While it is held, the event
+/// loop cannot apply PTY output or resize the terminal model, so operations
+/// waiting for those updates cannot complete.
+pub struct TerminalReadGuard<'a> {
+    /// Locked terminal model.
+    inner: RwLockReadGuard<'a, Term<SyncEventProxy>>,
+    /// Whether the model had not been observed since construction or its last update.
+    changed: bool,
+}
+
+impl TerminalReadGuard<'_> {
+    /// Whether this acquisition acknowledged a previously unobserved state.
+    ///
+    /// True on the first acquisition and the first acquisition after an applied
+    /// update, shared across all handle clones. Repeated calls on the same guard
+    /// return the same value. Use `TerminalReadGuard::changed(&guard)`.
+    pub fn changed(this: &Self) -> bool {
+        this.changed
+    }
+}
+
+impl Deref for TerminalReadGuard<'_> {
+    type Target = Term<SyncEventProxy>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl SharedTerminal {
     /// Acquire the terminal state and acknowledge everything visible in it.
     ///
     /// Observation is recorded only after the read lock is acquired, so a
     /// pending or cancelled acquisition does not acknowledge an intervening
     /// update.
-    pub(crate) async fn read(&self) -> RwLockReadGuard<'_, Term<SyncEventProxy>> {
-        let terminal = self.inner.terminal.read().await;
-        self.inner.observed.store(true, Ordering::Relaxed);
-        terminal
+    pub(crate) async fn read(&self) -> TerminalReadGuard<'_> {
+        let inner = self.inner.terminal.read().await;
+        let changed = !self.inner.observed.swap(true, Ordering::Relaxed);
+        TerminalReadGuard { inner, changed }
     }
 
     /// Mutate the terminal and return the events emitted by that mutation.
@@ -163,6 +195,37 @@ mod tests {
         let terminal = terminal.read().await;
         let dimensions = (terminal.screen_lines(), terminal.columns());
         assert_eq!(dimensions, (1, 2));
+    }
+
+    /// Each shared update is acknowledged by one acquisition, whose status
+    /// stays fixed even when another handle reads the same model.
+    #[tokio::test]
+    async fn guard_captures_shared_observation() {
+        let (terminal, event_proxy) = new(Config::default(), window_size(1, 2));
+        let observer = terminal.clone();
+        let first = terminal.read().await;
+        assert!(TerminalReadGuard::changed(&first));
+        assert!(!TerminalReadGuard::changed(&observer.read().await));
+        assert!(TerminalReadGuard::changed(&first));
+        drop(first);
+
+        for lines in [2, 3] {
+            terminal
+                .mutate(&event_proxy, |term| {
+                    term.resize(TerminalDimensions::from(window_size(lines, 2)));
+                    ((), true)
+                })
+                .await;
+        }
+        let updated = observer.read().await;
+        assert!(TerminalReadGuard::changed(&updated));
+        assert_eq!(updated.screen_lines(), 3);
+        assert!(!TerminalReadGuard::changed(&terminal.read().await));
+        assert!(TerminalReadGuard::changed(&updated));
+        drop(updated);
+
+        terminal.mutate(&event_proxy, |_term| ((), false)).await;
+        assert!(!TerminalReadGuard::changed(&terminal.read().await));
     }
 
     /// Terminal construction panics when the viewport has no screen lines.
@@ -323,7 +386,27 @@ mod tests {
 
         drop(write_guard);
         let read_guard = read.await;
+        assert!(TerminalReadGuard::changed(&read_guard));
         assert!(terminal.inner.observed.load(Ordering::Relaxed));
         drop(read_guard);
+    }
+
+    /// Cancelling a read while the model is write-locked leaves the update
+    /// available for the next observer to acknowledge.
+    #[tokio::test]
+    async fn cancelled_read_preserves_observation() {
+        let (terminal, _event_proxy) = new(Config::default(), window_size(1, 2));
+        let write_guard = terminal.inner.terminal.write().await;
+        {
+            let read = terminal.read();
+            tokio::pin!(read);
+            tokio::select! {
+                biased;
+                _guard = &mut read => panic!("read unexpectedly acquired the write-locked terminal"),
+                () = async {} => {},
+            }
+        }
+        drop(write_guard);
+        assert!(TerminalReadGuard::changed(&terminal.read().await));
     }
 }
