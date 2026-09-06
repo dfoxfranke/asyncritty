@@ -199,14 +199,13 @@ async fn from_fds_initial_geometry() {
 
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         input: _input,
         ..
     } = pty;
-    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
-        asyncritty::VoidListener
-    });
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = asyncritty::VoidListener;
     let terminal_size = {
         let terminal = handle.terminal().await;
         (terminal.screen_lines(), terminal.columns())
@@ -220,13 +219,16 @@ async fn from_fds_initial_geometry() {
     );
 
     handle.shutdown();
-    let (_output, _control) = event_loop.run().await.unwrap();
+    event_loop
+        .run(&mut control, &mut output, &mut listener)
+        .await
+        .unwrap();
     stop_child(&mut child).await;
     child_guard.disarm();
 }
 
 /// Event-loop construction derives terminal dimensions from a resize applied
-/// through its `PtyControl` before ownership is transferred.
+/// through its `PtyControl` before construction.
 #[tokio::test(flavor = "current_thread")]
 #[ntest::timeout(15_000)]
 async fn event_loop_uses_resized_control_geometry() {
@@ -257,14 +259,13 @@ async fn event_loop_uses_resized_control_geometry() {
 
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         input: _input,
         ..
     } = pty;
-    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
-        asyncritty::VoidListener
-    });
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = asyncritty::VoidListener;
     let terminal_size = {
         let terminal = handle.terminal().await;
         (terminal.screen_lines(), terminal.columns())
@@ -272,7 +273,10 @@ async fn event_loop_uses_resized_control_geometry() {
     assert_eq!(terminal_size, (31, 97));
 
     handle.shutdown();
-    let (_output, _control) = event_loop.run().await.unwrap();
+    event_loop
+        .run(&mut control, &mut output, &mut listener)
+        .await
+        .unwrap();
     stop_child(&mut child).await;
     child_guard.disarm();
 }
@@ -299,7 +303,7 @@ struct TitleListener {
 impl EventListener for TitleListener {
     type Error = ListenerFailure;
 
-    async fn title(&self, title: String) -> Result<(), Self::Error> {
+    async fn title(&mut self, title: String) -> Result<(), Self::Error> {
         self.titles
             .send(title)
             .await
@@ -320,12 +324,12 @@ struct ResizeResultListener {
 impl EventListener for ResizeResultListener {
     type Error = Infallible;
 
-    async fn wakeup(&self) -> Result<(), Self::Error> {
+    async fn wakeup(&mut self) -> Result<(), Self::Error> {
         let _ = self.wakeups.send(());
         Ok(())
     }
 
-    async fn resize_result(&self, result: io::Result<WindowSize>) -> Result<(), Self::Error> {
+    async fn resize_result(&mut self, result: io::Result<WindowSize>) -> Result<(), Self::Error> {
         let _ = self.results.send(result);
         Ok(())
     }
@@ -379,16 +383,20 @@ async fn input_is_independent_of_event_loop_lifetime() {
     pty.input.write_all(b"before-loop\n").await.unwrap();
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         mut input,
         ..
     } = pty;
     let (titles_tx, mut titles_rx) = mpsc::channel(1);
-    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), move |_| {
-        TitleListener { titles: titles_tx }
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = TitleListener { titles: titles_tx };
+    let task = tokio::spawn(async move {
+        event_loop
+            .run(&mut control, &mut output, &mut listener)
+            .await
+            .map(|()| (output, control))
     });
-    let task = tokio::spawn(event_loop.run());
 
     let title = titles_rx
         .recv()
@@ -428,12 +436,12 @@ struct RecordingListener {
 impl EventListener for RecordingListener {
     type Error = Infallible;
 
-    async fn title(&self, title: String) -> Result<(), Self::Error> {
+    async fn title(&mut self, title: String) -> Result<(), Self::Error> {
         let _ = self.observations.send(ListenerObservation::Title(title));
         Ok(())
     }
 
-    async fn wakeup(&self) -> Result<(), Self::Error> {
+    async fn wakeup(&mut self) -> Result<(), Self::Error> {
         let _ = self.observations.send(ListenerObservation::Wakeup);
         Ok(())
     }
@@ -452,12 +460,12 @@ struct ReobservingRecordingListener {
 impl EventListener for ReobservingRecordingListener {
     type Error = Infallible;
 
-    async fn title(&self, title: String) -> Result<(), Self::Error> {
+    async fn title(&mut self, title: String) -> Result<(), Self::Error> {
         let _ = self.observations.send(ListenerObservation::Title(title));
         Ok(())
     }
 
-    async fn wakeup(&self) -> Result<(), Self::Error> {
+    async fn wakeup(&mut self) -> Result<(), Self::Error> {
         let _ = self.observations.send(ListenerObservation::Wakeup);
         let _terminal = self.handle.terminal().await;
         Ok(())
@@ -501,18 +509,22 @@ async fn terminal_observation_coalesces_pty_wakeups() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         mut input,
         ..
     } = pty;
     let (observations_tx, mut observations_rx) = mpsc::unbounded_channel();
-    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), move |_| {
-        RecordingListener {
-            observations: observations_tx,
-        }
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = RecordingListener {
+        observations: observations_tx,
+    };
+    let task = tokio::spawn(async move {
+        event_loop
+            .run(&mut control, &mut output, &mut listener)
+            .await
+            .map(|()| (output, control))
     });
-    let task = tokio::spawn(event_loop.run());
 
     assert_eq!(
         next_listener_observation(&mut observations_rx).await,
@@ -569,24 +581,28 @@ async fn terminal_observation_coalesces_pty_wakeups() {
 }
 
 /// Closing every slave descriptor completes the event loop without waiting for
-/// the child and returns all event-loop-owned capabilities.
+/// the child and leaves the borrowed PTY capabilities usable.
 #[tokio::test(flavor = "current_thread")]
 #[ntest::timeout(15_000)]
-async fn slave_eof_returns_capabilities_and_stops_handle() {
+async fn slave_eof_retains_capabilities_and_stops_handle() {
     let pty = Pty::spawn(shell("exec sleep 30 0<&- 1>&- 2>&-"), window_size()).unwrap();
     let original_child = pty.child.id();
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         name,
         child,
-        output,
-        control,
+        mut output,
+        mut control,
         input,
     } = pty;
-    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
-        asyncritty::VoidListener
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = asyncritty::VoidListener;
+    let task = tokio::spawn(async move {
+        event_loop
+            .run(&mut control, &mut output, &mut listener)
+            .await
+            .map(|()| (output, control))
     });
-    let task = tokio::spawn(event_loop.run());
 
     let (output, control) = task
         .await
@@ -627,26 +643,27 @@ async fn slave_eof_flushes_synchronized_update() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         input: _input,
         ..
     } = pty;
     let (observations_tx, mut observations_rx) = mpsc::unbounded_channel();
-    let (event_loop, handle) =
-        EventLoop::new(output, control, TermConfig::default(), move |handle| {
-            ReobservingRecordingListener {
-                observations: observations_tx,
-                handle,
-            }
-        });
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = ReobservingRecordingListener {
+        observations: observations_tx,
+        handle: handle.clone(),
+    };
     {
         let _terminal = handle.terminal().await;
     }
 
-    let (_output, _control) = event_loop.run().await.unwrap();
+    event_loop
+        .run(&mut control, &mut output, &mut listener)
+        .await
+        .unwrap();
     let mut observations = Vec::new();
-    while let Some(observation) = observations_rx.recv().await {
+    while let Ok(observation) = observations_rx.try_recv() {
         observations.push(observation);
     }
     let title_index = observations
@@ -686,20 +703,24 @@ async fn resize_updates_pty_and_terminal() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         input: _input,
         ..
     } = pty;
     let (results_tx, mut results_rx) = mpsc::unbounded_channel();
     let (wakeups_tx, mut wakeups_rx) = mpsc::unbounded_channel();
-    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), move |_| {
-        ResizeResultListener {
-            results: results_tx,
-            wakeups: wakeups_tx,
-        }
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = ResizeResultListener {
+        results: results_tx,
+        wakeups: wakeups_tx,
+    };
+    let task = tokio::spawn(async move {
+        event_loop
+            .run(&mut control, &mut output, &mut listener)
+            .await
+            .map(|()| (output, control))
     });
-    let task = tokio::spawn(event_loop.run());
     let initially_unobserved = WindowSize {
         num_lines: 40,
         num_cols: 120,
@@ -768,16 +789,14 @@ async fn resize_updates_pty_and_terminal() {
     );
 
     handle.shutdown();
-    let (output, control) = task.await.unwrap().unwrap();
+    let (mut output, mut control) = task.await.unwrap().unwrap();
     let final_logical_size = {
         let terminal = handle.terminal().await;
         (terminal.screen_lines(), terminal.columns())
     };
     assert_eq!(final_logical_size, (42, 122));
-    let (next_event_loop, next_handle) =
-        EventLoop::new(output, control, TermConfig::default(), |_| {
-            asyncritty::VoidListener
-        });
+    let (mut next_event_loop, next_handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut next_listener = asyncritty::VoidListener;
     let next_terminal_size = {
         let terminal = next_handle.terminal().await;
         (terminal.screen_lines(), terminal.columns())
@@ -785,7 +804,10 @@ async fn resize_updates_pty_and_terminal() {
     assert_eq!(next_terminal_size, (42, 122));
 
     next_handle.shutdown();
-    let (_output, _control) = next_event_loop.run().await.unwrap();
+    next_event_loop
+        .run(&mut control, &mut output, &mut next_listener)
+        .await
+        .unwrap();
     stop_child(&mut child).await;
     child_guard.disarm();
 }
@@ -800,20 +822,24 @@ async fn invalid_resize_panics_before_submission() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         input: _input,
         ..
     } = pty;
     let (results_tx, mut results_rx) = mpsc::unbounded_channel();
     let (wakeups_tx, _wakeups_rx) = mpsc::unbounded_channel();
-    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), move |_| {
-        ResizeResultListener {
-            results: results_tx,
-            wakeups: wakeups_tx,
-        }
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = ResizeResultListener {
+        results: results_tx,
+        wakeups: wakeups_tx,
+    };
+    let task = tokio::spawn(async move {
+        event_loop
+            .run(&mut control, &mut output, &mut listener)
+            .await
+            .map(|()| (output, control))
     });
-    let task = tokio::spawn(event_loop.run());
 
     for invalid in [
         WindowSize {
@@ -871,7 +897,7 @@ struct ReadyListener {
 impl EventListener for ReadyListener {
     type Error = Infallible;
 
-    async fn title(&self, title: String) -> Result<(), Self::Error> {
+    async fn title(&mut self, title: String) -> Result<(), Self::Error> {
         if title == "ready" {
             self.ready.notify_one();
         }
@@ -904,7 +930,7 @@ struct PendingReadyListener {
 impl EventListener for PendingReadyListener {
     type Error = Infallible;
 
-    async fn title(&self, title: String) -> Result<(), Self::Error> {
+    async fn title(&mut self, title: String) -> Result<(), Self::Error> {
         if title == "ready" {
             let _drop_probe = CallbackFutureDropProbe {
                 dropped: Arc::clone(&self.dropped),
@@ -947,17 +973,22 @@ async fn final_master_owner_controls_hangup() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         mut input,
         ..
     } = pty;
     let ready = Arc::new(Notify::new());
-    let (event_loop, handle) =
-        EventLoop::new(output, control, TermConfig::default(), |_| ReadyListener {
-            ready: Arc::clone(&ready),
-        });
-    let task = tokio::spawn(event_loop.run());
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = ReadyListener {
+        ready: Arc::clone(&ready),
+    };
+    let task = tokio::spawn(async move {
+        event_loop
+            .run(&mut control, &mut output, &mut listener)
+            .await
+            .map(|()| (output, control))
+    });
 
     ready.notified().await;
     handle.shutdown();
@@ -1061,7 +1092,7 @@ struct FailingTitleListener;
 impl EventListener for FailingTitleListener {
     type Error = ListenerFailure;
 
-    async fn title(&self, title: String) -> Result<(), Self::Error> {
+    async fn title(&mut self, title: String) -> Result<(), Self::Error> {
         if title == "fail" {
             Err(ListenerFailure("deliberate listener failure"))
         } else {
@@ -1070,8 +1101,8 @@ impl EventListener for FailingTitleListener {
     }
 }
 
-/// A listener failure remains in the source chain and returns every
-/// event-loop-owned capability for `Pty` reconstruction.
+/// A listener failure remains in the source chain and leaves the borrowed PTY
+/// capabilities usable for `Pty` reconstruction.
 #[tokio::test(flavor = "current_thread")]
 #[ntest::timeout(15_000)]
 async fn listener_failure_retains_capabilities() {
@@ -1084,15 +1115,17 @@ async fn listener_failure_retains_capabilities() {
     let Pty {
         name,
         child,
-        output,
-        control,
+        mut output,
+        mut control,
         input,
     } = pty;
-    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
-        FailingTitleListener
-    });
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = FailingTitleListener;
 
-    let failure = event_loop.run().await.unwrap_err();
+    let failure = event_loop
+        .run(&mut control, &mut output, &mut listener)
+        .await
+        .unwrap_err();
     handle.wait_for_shutdown().await;
     let final_logical_size = {
         let terminal = handle.terminal().await;
@@ -1100,14 +1133,10 @@ async fn listener_failure_retains_capabilities() {
     };
     assert_eq!(final_logical_size, (24, 80));
     assert!(matches!(
-        &failure.error,
+        &failure,
         EventLoopError::Listener(error) if error.0 == "deliberate listener failure"
     ));
-    let loop_source = failure
-        .source()
-        .and_then(|source| source.downcast_ref::<EventLoopError<ListenerFailure>>())
-        .expect("EventLoopFailure exposes EventLoopError as its source");
-    let listener_source = loop_source
+    let listener_source = failure
         .source()
         .and_then(|source| source.downcast_ref::<ListenerFailure>())
         .expect("EventLoopError::Listener exposes its listener error as its source");
@@ -1116,8 +1145,8 @@ async fn listener_failure_retains_capabilities() {
     let mut pty = Pty {
         name,
         child,
-        output: failure.output,
-        control: failure.control,
+        output,
+        control,
         input,
     };
     pty.control.resize(window_size()).unwrap();
@@ -1158,20 +1187,24 @@ async fn abort_retains_independent_input() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         mut input,
         ..
     } = pty;
     let callback_entered = Arc::new(Notify::new());
     let callback_dropped = Arc::new(Notify::new());
-    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
-        PendingReadyListener {
-            entered: Arc::clone(&callback_entered),
-            dropped: Arc::clone(&callback_dropped),
-        }
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = PendingReadyListener {
+        entered: Arc::clone(&callback_entered),
+        dropped: Arc::clone(&callback_dropped),
+    };
+    let task = tokio::spawn(async move {
+        event_loop
+            .run(&mut control, &mut output, &mut listener)
+            .await
+            .map(|()| (output, control))
     });
-    let task = tokio::spawn(event_loop.run());
 
     callback_entered.notified().await;
     task.abort();

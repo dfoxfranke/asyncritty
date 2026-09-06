@@ -8,11 +8,12 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::{pending, poll_fn};
 use std::io;
+use std::sync::Arc;
 
 use alacritty_terminal::term;
 use alacritty_terminal::vte::ansi;
 use tokio::io::ReadBuf;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::time::{Instant, sleep_until};
 
 use crate::WindowSize;
@@ -42,13 +43,19 @@ enum LoopState {
 struct LoopControl {
     /// Current lifecycle state and its transition notifications.
     state: watch::Sender<LoopState>,
+
+    /// Completion notifications retained by registered waiters across restarts.
+    stopped: Arc<Notify>,
 }
 
 impl LoopControl {
     /// Create running state and its first observer.
     fn new() -> (Self, watch::Receiver<LoopState>) {
         let (state, receiver) = watch::channel(LoopState::Running);
-        let control = Self { state };
+        let control = Self {
+            state,
+            stopped: Arc::new(Notify::new()),
+        };
         (control, receiver)
     }
 
@@ -64,8 +71,7 @@ impl LoopControl {
 
     /// Transition a running loop to shutdown requested.
     ///
-    /// If the state is already not running, the request is a no-op; lifecycle
-    /// states never return to [`LoopState::Running`].
+    /// If the state is already not running, the request is a no-op.
     fn request_shutdown(&self) {
         self.state.send_if_modified(|state| {
             if *state != LoopState::Running {
@@ -77,9 +83,20 @@ impl LoopControl {
         });
     }
 
+    /// Begin another run, preserving any shutdown request made before the first run.
+    fn restart(&self) {
+        self.state.send_if_modified(|state| {
+            if *state != LoopState::Stopped {
+                return false;
+            }
+            *state = LoopState::Running;
+            true
+        });
+    }
+
     /// Publish that the event loop has stopped.
     fn publish_stopped(&self) {
-        self.state.send_if_modified(|state| {
+        let stopped = self.state.send_if_modified(|state| {
             if *state == LoopState::Stopped {
                 return false;
             }
@@ -87,11 +104,9 @@ impl LoopControl {
             *state = LoopState::Stopped;
             true
         });
-    }
-
-    /// Observe the current loop state and future lifecycle transitions.
-    fn subscribe(&self) -> watch::Receiver<LoopState> {
-        self.state.subscribe()
+        if stopped {
+            self.stopped.notify_waiters();
+        }
     }
 }
 
@@ -137,8 +152,8 @@ impl EventLoopHandle {
     /// the terminal model. Drop it before waiting for either operation.
     ///
     /// Acquiring the guard marks the state as observed, enabling the next
-    /// [`EventListener::wakeup`] notification. After the loop stops, the guard
-    /// gives access to the final terminal state. Use
+    /// [`EventListener::wakeup`] notification. After a run stops, the guard
+    /// gives access to its retained terminal state. Use
     /// [`TerminalReadGuard::changed`] to check whether this acquisition
     /// acknowledged a previously unobserved update.
     pub async fn terminal(&self) -> TerminalReadGuard<'_> {
@@ -157,9 +172,9 @@ impl EventLoopHandle {
     /// no result event. A request made during a listener callback waits for that
     /// callback to finish.
     ///
-    /// Stopping the loop can discard pending requests or their result events.
-    /// Valid requests made after shutdown is requested or the loop stops are
-    /// ignored.
+    /// Pending requests and undelivered result events are retained for the next
+    /// run. Valid requests made after shutdown is requested or the loop stops
+    /// are ignored.
     ///
     /// # Panics
     ///
@@ -181,13 +196,13 @@ impl EventLoopHandle {
 
     /// Request orderly shutdown of the event loop, returning immediately.
     ///
-    /// The loop finishes any active listener callback, then discards queued
-    /// events. An error from that callback is returned by [`EventLoop::run`].
-    /// A callback that stays pending prevents shutdown from completing.
+    /// The loop finishes any active listener callback, retaining queued events
+    /// for the next run. An error from that callback is returned by
+    /// [`EventLoop::run`]. A callback that stays pending prevents shutdown from
+    /// completing.
     ///
-    /// Await [`EventLoop::run`] to recover the PTY output and control handles, or
-    /// [`wait_for_shutdown`](Self::wait_for_shutdown) to observe that the loop
-    /// has stopped.
+    /// Await [`EventLoop::run`] or [`wait_for_shutdown`](Self::wait_for_shutdown)
+    /// to observe that the current run has stopped.
     ///
     /// Repeated requests have no additional effect.
     pub fn shutdown(&self) {
@@ -199,15 +214,16 @@ impl EventLoopHandle {
     /// Completes when [`EventLoop::run`] returns, or when the loop or its running
     /// future is dropped. At that point, PTY processing, resizing, and listener
     /// callbacks have ended. If the loop has already stopped, returns
-    /// immediately.
+    /// immediately. An already-waiting caller observes completion even if the
+    /// loop restarts before that caller resumes. New waits after a restart
+    /// observe the new run.
     ///
     /// Call [`shutdown`](Self::shutdown) to request that the loop stop.
     ///
     /// Awaiting this method from the loop's own listener callback deadlocks:
     /// the loop must finish the callback before it can stop.
     pub async fn wait_for_shutdown(&self) {
-        let mut lifecycle = self.control.subscribe();
-        wait_until_stopped(&mut lifecycle).await;
+        wait_until_stopped(&self.control).await;
     }
 }
 
@@ -251,33 +267,6 @@ impl<E: Error + Send + Sync + 'static> From<io::Error> for EventLoopError<E> {
     }
 }
 
-/// An [`EventLoop::run`] error together with the PTY handles it owned.
-///
-/// The returned handles remain available for further PTY I/O.
-#[derive(Debug)]
-pub struct EventLoopFailure<E: Error + Send + Sync + 'static> {
-    /// Failure that stopped the loop.
-    pub error: EventLoopError<E>,
-
-    /// PTY output handle released by the stopped loop.
-    pub output: PtyOutput,
-
-    /// PTY control handle released by the stopped loop.
-    pub control: PtyControl,
-}
-
-impl<E: Error + Send + Sync + 'static> Display for EventLoopFailure<E> {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str("event loop failed")
-    }
-}
-
-impl<E: Error + Send + Sync + 'static> Error for EventLoopFailure<E> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.error)
-    }
-}
-
 /// Reads PTY output into an Alacritty [`Term`](alacritty_terminal::Term) and
 /// delivers terminal events to an asynchronous [`EventListener`].
 ///
@@ -285,21 +274,21 @@ impl<E: Error + Send + Sync + 'static> Error for EventLoopFailure<E> {
 /// returned by [`new`](Self::new) to inspect terminal state, resize the terminal,
 /// or request shutdown. Input is written separately through
 /// [`PtyInput`](crate::PtyInput).
-pub struct EventLoop<L: EventListener> {
+pub struct EventLoop {
     /// Terminal model receiving parsed PTY output.
     terminal: SharedTerminal,
 
     /// Collector paired with the event proxy installed in the terminal.
     terminal_events: SyncEventProxy,
 
-    /// Heap storage preserves `EventLoop<L>: Unpin` independently of `L`.
-    listener: Box<L>,
+    /// Parser state retained between calls to `run`.
+    parser: ansi::Processor,
 
-    /// PTY output read by the event loop.
-    output: PtyOutput,
+    /// Events not yet dispatched, retained in emission order between runs.
+    pending_events: VecDeque<Event>,
 
-    /// PTY settings applied by the event loop.
-    pty_control: PtyControl,
+    /// Window size last applied to the terminal model.
+    window_size: WindowSize,
 
     /// Latest resize not yet selected for processing.
     resizes: watch::Receiver<WindowSize>,
@@ -314,31 +303,16 @@ pub struct EventLoop<L: EventListener> {
     stop_on_drop: StopOnDrop,
 }
 
-impl<L: EventListener> EventLoop<L> {
-    /// Create a terminal model and event loop from the output and control fields
-    /// of a [`Pty`](crate::Pty). The caller retains its child and manages process
-    /// waiting and signaling independently.
-    ///
-    /// `terminal_config` configures the Alacritty terminal model. Its initial
-    /// size is the window size most recently applied through `pty_control`.
-    ///
-    /// `make_listener` receives a clone of the returned handle so that the
-    /// listener can access terminal state and request resizes or shutdown.
+impl EventLoop {
+    /// Create a terminal model using the size most recently applied through
+    /// `control`. `terminal_config` configures the Alacritty terminal model.
     ///
     /// # Panics
     ///
-    /// Panics if `pty_control`'s recorded window size has no lines or
-    /// fewer than two columns.
-    pub fn new<F>(
-        output: PtyOutput,
-        pty_control: PtyControl,
-        terminal_config: term::Config,
-        make_listener: F,
-    ) -> (Self, EventLoopHandle)
-    where
-        F: FnOnce(EventLoopHandle) -> L,
-    {
-        let initial_window_size = pty_control.recorded_window_size();
+    /// Panics if `control`'s recorded window size has no lines or fewer than
+    /// two columns.
+    pub fn new(terminal_config: term::Config, control: &PtyControl) -> (Self, EventLoopHandle) {
+        let initial_window_size = control.recorded_window_size();
         let (resizes_tx, resizes) = watch::channel(initial_window_size);
         let (control, lifecycle) = LoopControl::new();
         let (terminal, terminal_events) = terminal::new(terminal_config, initial_window_size);
@@ -347,13 +321,12 @@ impl<L: EventListener> EventLoop<L> {
             resizes: resizes_tx.clone(),
             control: control.clone(),
         };
-        let listener = Box::new(make_listener(handle.clone()));
         let event_loop = Self {
             terminal,
             terminal_events,
-            listener,
-            output,
-            pty_control,
+            parser: ansi::Processor::new(),
+            pending_events: VecDeque::new(),
+            window_size: initial_window_size,
             resizes,
             _resize_guard: resizes_tx,
             lifecycle,
@@ -366,8 +339,20 @@ impl<L: EventListener> EventLoop<L> {
     /// Process PTY output and listener events until shutdown, PTY EOF, or an
     /// error.
     ///
-    /// On success, returns the PTY output and control handles. The loop never
-    /// owns, waits for, or signals the independently managed child.
+    /// The output, control, and listener remain owned by the caller. The loop
+    /// never owns, waits for, or signals the independently managed child.
+    ///
+    /// Each call first checks the size most recently applied through `control`.
+    /// Queued events from the previous run are delivered before applying any
+    /// size change. Once they finish, if the size differs from the model's last
+    /// size, the model is resized and [`EventListener::resize_result`] is
+    /// delivered before processing requests or reading output. If a queued
+    /// callback fails or requests shutdown, resizing waits for a later run.
+    ///
+    /// Call this method again to resume after a listener error, with the same
+    /// listener or a different one. Terminal state, parser state, and events
+    /// whose callbacks have not started are retained. An event whose callback
+    /// returned an error is not retried.
     ///
     /// PTY EOF completes the loop normally. The `EIO` error used for slave
     /// closure on Linux is also treated as EOF. At EOF, the loop applies any
@@ -381,45 +366,73 @@ impl<L: EventListener> EventLoop<L> {
     /// state through [`EventLoopHandle::terminal`].
     ///
     /// [`EventLoopHandle::shutdown`] requests orderly completion, waiting for
-    /// the active callback and discarding queued events.
+    /// the active callback and retaining queued events for the next run.
     ///
     /// # Cancellation
     ///
     /// Dropping this future stops processing and cancels any active listener
-    /// callback without waiting for it to finish. Queued events and output
-    /// buffered by the parser are discarded. Already-applied model updates
-    /// remain accessible through [`EventLoopHandle::terminal`].
+    /// callback without waiting for it to finish. That callback's event is not
+    /// retried. Terminal state, parser state, and events whose callbacks have
+    /// not started are retained for the next call. The caller keeps the borrowed
+    /// output, control, and listener.
     ///
-    /// Cancellation drops the listener and the loop's PTY output and control
-    /// handles. If no other handles keep the PTY master open, it closes, which
-    /// can cause a terminal hangup.
-    ///
-    /// To let the active callback finish and recover the PTY handles, call
-    /// [`EventLoopHandle::shutdown`] and continue awaiting this future. Shutdown
-    /// cannot complete while that callback remains pending.
+    /// To let the active callback finish, call [`EventLoopHandle::shutdown`]
+    /// and continue awaiting this future. Shutdown cannot complete while that
+    /// callback remains pending.
     ///
     /// # Errors
     ///
-    /// PTY read errors stop the loop. The first
-    /// listener callback error also stops the loop, discarding queued events.
-    /// [`EventLoopFailure`] retains the PTY output and control handles
-    /// along with the error.
+    /// PTY read errors and the first listener callback error stop the current
+    /// run. Events whose callbacks have not started remain queued.
     ///
     /// # Panics
     ///
     /// May panic when first polled outside a Tokio runtime. May also panic if
     /// parsed output starts a synchronized update while the runtime has no time
-    /// driver.
-    pub async fn run(mut self) -> Result<(PtyOutput, PtyControl), EventLoopFailure<L::Error>> {
-        let mut parser: ansi::Processor = ansi::Processor::new();
+    /// driver. Panics if `control`'s recorded window size has no lines or fewer
+    /// than two columns.
+    pub async fn run<L: EventListener>(
+        &mut self,
+        control: &mut PtyControl,
+        output: &mut PtyOutput,
+        listener: &mut L,
+    ) -> Result<(), EventLoopError<L::Error>> {
+        self.stop_on_drop.0.restart();
+        let _stop_on_return = StopOnDrop(self.stop_on_drop.0.clone());
+        let window_size = control.recorded_window_size();
+        assert!(
+            window_size.num_lines > 0,
+            "terminal geometry must contain at least one line"
+        );
+        assert!(
+            window_size.num_cols >= 2,
+            "terminal geometry must contain at least two columns"
+        );
+        self.deliver_events(listener).await?;
+        if !self.stop_on_drop.0.is_running() {
+            return Ok(());
+        }
+        if window_size.num_lines != self.window_size.num_lines
+            || window_size.num_cols != self.window_size.num_cols
+            || window_size.cell_width != self.window_size.cell_width
+            || window_size.cell_height != self.window_size.cell_height
+        {
+            let events = self.resize_terminal(window_size).await;
+            self.pending_events.extend(events);
+            self.deliver_events(listener).await?;
+        }
         let mut read_buffer = vec![0; READ_BUFFER_SIZE];
 
-        let result = loop {
+        loop {
             if !self.stop_on_drop.0.is_running() {
                 break Ok(());
             }
 
-            let sync_deadline = parser.sync_timeout().sync_timeout().map(Instant::from_std);
+            let sync_deadline = self
+                .parser
+                .sync_timeout()
+                .sync_timeout()
+                .map(Instant::from_std);
             let action = tokio::select! {
                 _ = wait_until_not_running(&mut self.lifecycle) => LoopAction::Stop,
                 resize = self.resizes.changed() => {
@@ -427,14 +440,15 @@ impl<L: EventListener> EventLoop<L> {
                     LoopAction::Resize(*self.resizes.borrow_and_update())
                 },
                 _ = wait_for_deadline(sync_deadline) => LoopAction::SyncTimeout,
-                result = read_once(&self.output, &mut read_buffer) => LoopAction::Read(result),
+                result = read_once(output, &mut read_buffer) => LoopAction::Read(result),
             };
 
             match action {
                 LoopAction::Stop => break Ok(()),
                 LoopAction::Resize(resize) => {
-                    let events = self.apply_resize(resize).await;
-                    if let Err(error) = self.deliver_events(events).await {
+                    let events = self.apply_resize(control, resize).await;
+                    self.pending_events.extend(events);
+                    if let Err(error) = self.deliver_events(listener).await {
                         break Err(error);
                     }
                 }
@@ -442,10 +456,11 @@ impl<L: EventListener> EventLoop<L> {
                     let (_, events) = self
                         .terminal
                         .mutate(&self.terminal_events, |terminal| {
-                            (parser.stop_sync(terminal), true)
+                            (self.parser.stop_sync(terminal), true)
                         })
                         .await;
-                    if let Err(error) = self.deliver_events(events).await {
+                    self.pending_events.extend(events);
+                    if let Err(error) = self.deliver_events(listener).await {
                         break Err(error);
                     }
                 }
@@ -457,7 +472,7 @@ impl<L: EventListener> EventLoop<L> {
                         Err(error) => break Err(error.into()),
                     };
                     let Some(count) = count else {
-                        match self.finish_pty_eof(&mut parser).await {
+                        match self.finish_pty_eof(listener).await {
                             Ok(()) => break Ok(()),
                             Err(error) => break Err(error),
                         }
@@ -466,18 +481,17 @@ impl<L: EventListener> EventLoop<L> {
                     let (_, events) = self
                         .terminal
                         .mutate(&self.terminal_events, |terminal| {
-                            parser.advance(terminal, &read_buffer[..count]);
-                            ((), parser.sync_bytes_count() < count)
+                            self.parser.advance(terminal, &read_buffer[..count]);
+                            ((), self.parser.sync_bytes_count() < count)
                         })
                         .await;
-                    if let Err(error) = self.deliver_events(events).await {
+                    self.pending_events.extend(events);
+                    if let Err(error) = self.deliver_events(listener).await {
                         break Err(error);
                     }
                 }
             }
-        };
-
-        self.complete(result)
+        }
     }
 
     /// Apply and deliver a synchronized update still buffered at PTY EOF.
@@ -485,30 +499,40 @@ impl<L: EventListener> EventLoop<L> {
     /// # Errors
     ///
     /// Returns a listener error if delivery of the applied update fails.
-    async fn finish_pty_eof(
+    async fn finish_pty_eof<L: EventListener>(
         &mut self,
-        parser: &mut ansi::Processor,
+        listener: &mut L,
     ) -> Result<(), EventLoopError<L::Error>> {
-        if parser.sync_timeout().sync_timeout().is_none() {
+        if self.parser.sync_timeout().sync_timeout().is_none() {
             return Ok(());
         }
 
         let (_, events) = self
             .terminal
             .mutate(&self.terminal_events, |terminal| {
-                (parser.stop_sync(terminal), true)
+                (self.parser.stop_sync(terminal), true)
             })
             .await;
-        self.deliver_events(events).await?;
+        self.pending_events.extend(events);
+        self.deliver_events(listener).await?;
         Ok(())
     }
 
     /// Apply one claimed resize and return its events in delivery order.
-    async fn apply_resize(&mut self, window_size: WindowSize) -> VecDeque<Event> {
-        if let Err(error) = self.pty_control.resize(window_size) {
+    async fn apply_resize(
+        &mut self,
+        control: &mut PtyControl,
+        window_size: WindowSize,
+    ) -> VecDeque<Event> {
+        if let Err(error) = control.resize(window_size) {
             return VecDeque::from([Event::ResizeResult(Err(error))]);
         }
 
+        self.resize_terminal(window_size).await
+    }
+
+    /// Update the model to an already-applied PTY size and report completion.
+    async fn resize_terminal(&mut self, window_size: WindowSize) -> VecDeque<Event> {
         let (_, mut events) = self
             .terminal
             .mutate(&self.terminal_events, |terminal| {
@@ -518,57 +542,33 @@ impl<L: EventListener> EventLoop<L> {
                 )
             })
             .await;
+        self.window_size = window_size;
         events.push_back(Event::ResizeResult(Ok(window_size)));
         events
     }
 
-    /// Deliver one event batch in order while the loop remains running.
+    /// Drain queued events in order while the loop remains running.
     ///
     /// Once a callback is admitted, it completes before shutdown is observed
-    /// again. Undelivered events are dropped with the batch.
+    /// again. Events not yet dispatched remain queued for the next run.
     ///
     /// # Errors
     ///
     /// Returns the first error produced by an admitted listener callback.
-    async fn deliver_events(
-        &self,
-        mut events: VecDeque<Event>,
+    async fn deliver_events<L: EventListener>(
+        &mut self,
+        listener: &mut L,
     ) -> Result<(), EventLoopError<L::Error>> {
         while self.stop_on_drop.0.is_running() {
-            let Some(event) = events.pop_front() else {
+            let Some(event) = self.pending_events.pop_front() else {
                 return Ok(());
             };
-            if let Err(error) = dispatch_event(self.listener.as_ref(), event).await {
+            if let Err(error) = dispatch_event(listener, event).await {
                 return Err(EventLoopError::Listener(error));
             }
         }
 
         Ok(())
-    }
-
-    /// Return the PTY capabilities alongside the loop outcome.
-    ///
-    /// # Errors
-    ///
-    /// Returns the loop error together with the PTY capabilities.
-    #[allow(
-        clippy::result_large_err,
-        reason = "both completion paths return the same owned capabilities"
-    )]
-    fn complete(
-        self,
-        result: Result<(), EventLoopError<L::Error>>,
-    ) -> Result<(PtyOutput, PtyControl), EventLoopFailure<L::Error>> {
-        let output = self.output;
-        let control = self.pty_control;
-        match result {
-            Ok(()) => Ok((output, control)),
-            Err(error) => Err(EventLoopFailure {
-                error,
-                output,
-                control,
-            }),
-        }
     }
 }
 
@@ -614,13 +614,12 @@ async fn wait_until_not_running(lifecycle: &mut watch::Receiver<LoopState>) {
 }
 
 /// Wait until the event loop has stopped.
-async fn wait_until_stopped(lifecycle: &mut watch::Receiver<LoopState>) {
-    if lifecycle
-        .wait_for(|state| *state == LoopState::Stopped)
-        .await
-        .is_err()
-    {
-        pending::<()>().await;
+async fn wait_until_stopped(control: &LoopControl) {
+    let stopped = control.stopped.notified();
+    tokio::pin!(stopped);
+    stopped.as_mut().enable();
+    if control.state() != LoopState::Stopped {
+        stopped.await;
     }
 }
 
@@ -856,6 +855,38 @@ mod tests {
         assert_eq!(
             poll_with_waker(late.as_mut(), Waker::noop()),
             Poll::Ready(()),
+        );
+    }
+
+    /// A registered waiter observes completion even when another run starts
+    /// before it is polled again; new waiters await the new run's completion.
+    #[test]
+    fn shutdown_wait_survives_immediate_restart() {
+        let HandleFixture {
+            handle, control, ..
+        } = handle_fixture();
+        let mut first = std::pin::pin!(handle.wait_for_shutdown());
+        assert_eq!(
+            poll_with_waker(first.as_mut(), Waker::noop()),
+            Poll::Pending
+        );
+
+        control.publish_stopped();
+        control.restart();
+        assert_eq!(
+            poll_with_waker(first.as_mut(), Waker::noop()),
+            Poll::Ready(())
+        );
+
+        let mut second = std::pin::pin!(handle.wait_for_shutdown());
+        assert_eq!(
+            poll_with_waker(second.as_mut(), Waker::noop()),
+            Poll::Pending
+        );
+        control.publish_stopped();
+        assert_eq!(
+            poll_with_waker(second.as_mut(), Waker::noop()),
+            Poll::Ready(())
         );
     }
 }

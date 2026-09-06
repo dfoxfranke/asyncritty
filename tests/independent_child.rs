@@ -11,7 +11,7 @@ struct BlockedTitle {
 }
 impl EventListener for BlockedTitle {
     type Error = io::Error;
-    async fn title(&self, _: String) -> io::Result<()> {
+    async fn title(&mut self, _: String) -> io::Result<()> {
         self.entered.notify_one();
         std::future::pending().await
     }
@@ -26,8 +26,8 @@ async fn child_reaping_is_independent_of_listener() {
     command.args(["-c", r"printf '\033]2;blocked\007'"]);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         input,
         ..
     } = Pty::spawn(
@@ -41,11 +41,16 @@ async fn child_reaping_is_independent_of_listener() {
     )
     .unwrap();
     let entered = Arc::new(Notify::new());
-    let (event_loop, handle) =
-        EventLoop::new(output, control, Default::default(), |_| BlockedTitle {
-            entered: entered.clone(),
-        });
-    let task = tokio::spawn(event_loop.run());
+    let (mut event_loop, handle) = EventLoop::new(Default::default(), &control);
+    let mut listener = BlockedTitle {
+        entered: entered.clone(),
+    };
+    let task = tokio::spawn(async move {
+        event_loop
+            .run(&mut control, &mut output, &mut listener)
+            .await
+            .map(|()| (output, control))
+    });
     tokio::time::timeout(Duration::from_secs(5), entered.notified())
         .await
         .unwrap();

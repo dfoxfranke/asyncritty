@@ -29,23 +29,23 @@ pub trait EventListener: Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
     /// Reconsider the mouse cursor shape after a terminal-state change.
-    fn mouse_cursor_dirty(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn mouse_cursor_dirty(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
         ready(Ok(()))
     }
 
     /// Set the window title requested by the terminal application.
-    fn title(&self, _title: String) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn title(&mut self, _title: String) -> impl Future<Output = Result<(), Self::Error>> + Send {
         ready(Ok(()))
     }
 
     /// Restore the window title to the application's default.
-    fn reset_title(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn reset_title(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
         ready(Ok(()))
     }
 
     /// Store text in the selected clipboard at the terminal application's request.
     fn clipboard_store(
-        &self,
+        &mut self,
         _clipboard: ClipboardType,
         _text: String,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
@@ -57,7 +57,7 @@ pub trait EventListener: Send + Sync + 'static {
     /// Pass the selected clipboard's contents to the supplied formatter, then
     /// write the resulting escape sequence through [`PtyInput`](crate::PtyInput).
     fn clipboard_load(
-        &self,
+        &mut self,
         _clipboard: ClipboardType,
         _formatter: Arc<dyn Fn(&str) -> String + Send + Sync + 'static>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
@@ -70,7 +70,7 @@ pub trait EventListener: Send + Sync + 'static {
     /// numbering. Pass the color's value to the supplied formatter, then write
     /// the resulting escape sequence through [`PtyInput`](crate::PtyInput).
     fn color_request(
-        &self,
+        &mut self,
         _index: usize,
         _formatter: Arc<dyn Fn(Rgb) -> String + Send + Sync + 'static>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
@@ -78,7 +78,7 @@ pub trait EventListener: Send + Sync + 'static {
     }
 
     /// Send terminal-generated text through [`PtyInput`](crate::PtyInput).
-    fn pty_write(&self, _text: String) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn pty_write(&mut self, _text: String) -> impl Future<Output = Result<(), Self::Error>> + Send {
         ready(Ok(()))
     }
 
@@ -88,7 +88,7 @@ pub trait EventListener: Send + Sync + 'static {
     /// supplied formatter, then write the resulting escape sequence through
     /// [`PtyInput`](crate::PtyInput).
     fn text_area_size_request(
-        &self,
+        &mut self,
         _formatter: Arc<dyn Fn(WindowSize) -> String + Send + Sync + 'static>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         ready(Ok(()))
@@ -98,7 +98,7 @@ pub trait EventListener: Send + Sync + 'static {
     ///
     /// Read the current setting from [`Term::cursor_style`](crate::Term::cursor_style)
     /// through [`EventLoopHandle::terminal`](crate::EventLoopHandle::terminal).
-    fn cursor_blinking_change(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn cursor_blinking_change(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
         ready(Ok(()))
     }
 
@@ -111,28 +111,29 @@ pub trait EventListener: Send + Sync + 'static {
     /// further updates are coalesced until the terminal is acquired again
     /// through any handle clone. PTY output held by synchronized-update
     /// buffering does not invoke this callback until it is applied.
-    fn wakeup(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn wakeup(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
         ready(Ok(()))
     }
 
     /// Handle a request to ring the terminal bell.
-    fn bell(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn bell(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
         ready(Ok(()))
     }
 
     /// Handle a shutdown request from the terminal model.
-    fn exit(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn exit(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
         ready(Ok(()))
     }
 
     /// Handle the outcome of an [`EventLoopHandle::resize`](crate::EventLoopHandle::resize)
-    /// request.
+    /// request, or a size change detected when [`EventLoop::run`](crate::EventLoop::run)
+    /// starts.
     ///
     /// On success, receives the requested [`WindowSize`] after the PTY size and
     /// terminal grid dimensions have been updated. An error reports that the PTY
     /// resize failed; the terminal model keeps its previous dimensions.
     fn resize_result(
-        &self,
+        &mut self,
         _result: io::Result<WindowSize>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         ready(Ok(()))
@@ -166,7 +167,7 @@ impl From<TerminalEvent> for Event {
 ///
 /// Returns the error produced by the selected callback unchanged.
 pub(crate) async fn dispatch_event<L: EventListener + ?Sized>(
-    listener: &L,
+    listener: &mut L,
     event: Event,
 ) -> Result<(), L::Error> {
     match event {
@@ -290,41 +291,41 @@ mod tests {
     #[derive(Default)]
     struct RecordingListener {
         /// Callback observations in dispatch order.
-        observations: Mutex<Vec<Observation>>,
+        observations: Vec<Observation>,
     }
 
     impl RecordingListener {
         /// Append one callback observation.
-        fn record(&self, observation: Observation) {
-            self.observations.lock().unwrap().push(observation);
+        fn record(&mut self, observation: Observation) {
+            self.observations.push(observation);
         }
 
         /// Remove every callback observation in dispatch order.
-        fn take_observations(&self) -> Vec<Observation> {
-            std::mem::take(&mut *self.observations.lock().unwrap())
+        fn take_observations(&mut self) -> Vec<Observation> {
+            std::mem::take(&mut self.observations)
         }
     }
 
     impl EventListener for RecordingListener {
         type Error = Infallible;
 
-        fn mouse_cursor_dirty(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        fn mouse_cursor_dirty(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
             self.record(Observation::MouseCursorDirty);
             ready(Ok(()))
         }
 
-        fn title(&self, title: String) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        fn title(&mut self, title: String) -> impl Future<Output = Result<(), Self::Error>> + Send {
             self.record(Observation::Title(title));
             ready(Ok(()))
         }
 
-        fn reset_title(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        fn reset_title(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
             self.record(Observation::ResetTitle);
             ready(Ok(()))
         }
 
         fn clipboard_store(
-            &self,
+            &mut self,
             clipboard: ClipboardType,
             text: String,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
@@ -333,7 +334,7 @@ mod tests {
         }
 
         fn clipboard_load(
-            &self,
+            &mut self,
             clipboard: ClipboardType,
             formatter: Arc<dyn Fn(&str) -> String + Send + Sync + 'static>,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
@@ -345,7 +346,7 @@ mod tests {
         }
 
         fn color_request(
-            &self,
+            &mut self,
             index: usize,
             formatter: Arc<dyn Fn(Rgb) -> String + Send + Sync + 'static>,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
@@ -356,13 +357,16 @@ mod tests {
             ready(Ok(()))
         }
 
-        fn pty_write(&self, text: String) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        fn pty_write(
+            &mut self,
+            text: String,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             self.record(Observation::PtyWrite(text));
             ready(Ok(()))
         }
 
         fn text_area_size_request(
-            &self,
+            &mut self,
             formatter: Arc<dyn Fn(WindowSize) -> String + Send + Sync + 'static>,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             self.record(Observation::TextAreaSizeRequest(formatter(WindowSize {
@@ -374,28 +378,30 @@ mod tests {
             ready(Ok(()))
         }
 
-        fn cursor_blinking_change(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        fn cursor_blinking_change(
+            &mut self,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             self.record(Observation::CursorBlinkingChange);
             ready(Ok(()))
         }
 
-        fn wakeup(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        fn wakeup(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
             self.record(Observation::Wakeup);
             ready(Ok(()))
         }
 
-        fn bell(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        fn bell(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
             self.record(Observation::Bell);
             ready(Ok(()))
         }
 
-        fn exit(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        fn exit(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
             self.record(Observation::Exit);
             ready(Ok(()))
         }
 
         fn resize_result(
-            &self,
+            &mut self,
             result: io::Result<WindowSize>,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             let result = result
@@ -439,7 +445,7 @@ mod tests {
     /// child-exit events are ignored.
     #[tokio::test]
     async fn dispatches_terminal_events_and_ignores_child_exit() {
-        let listener = RecordingListener::default();
+        let mut listener = RecordingListener::default();
         let events = [
             TerminalEvent::MouseCursorDirty.into(),
             TerminalEvent::Title("new title".into()).into(),
@@ -478,7 +484,7 @@ mod tests {
         ];
 
         for event in events {
-            dispatch_event(&listener, event).await.unwrap();
+            dispatch_event(&mut listener, event).await.unwrap();
         }
 
         assert_eq!(
@@ -532,7 +538,7 @@ mod tests {
         ];
 
         for event in events {
-            dispatch_event(&VoidListener, event).await.unwrap();
+            dispatch_event(&mut VoidListener, event).await.unwrap();
         }
     }
 }

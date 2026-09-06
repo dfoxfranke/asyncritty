@@ -79,7 +79,7 @@ struct GateListener {
 impl EventListener for GateListener {
     type Error = Infallible;
 
-    async fn title(&self, title: String) -> Result<(), Self::Error> {
+    async fn title(&mut self, title: String) -> Result<(), Self::Error> {
         let is_first = title == "first";
         let _ = self.titles.send(title).await;
         if is_first {
@@ -113,20 +113,24 @@ async fn listener_backpressure_does_not_block_direct_input() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         mut input,
         ..
     } = pty;
     let (titles_tx, mut titles_rx) = mpsc::channel(2);
     let release_first = Arc::new(Semaphore::new(0));
-    let listener = GateListener {
+    let mut listener = GateListener {
         titles: titles_tx,
         release_first: Arc::clone(&release_first),
     };
-    let (event_loop, handle) =
-        EventLoop::new(output, control, TermConfig::default(), move |_| listener);
-    let task = tokio::spawn(event_loop.run());
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let task = tokio::spawn(async move {
+        event_loop
+            .run(&mut control, &mut output, &mut listener)
+            .await
+            .map(|()| (output, control))
+    });
 
     let first = titles_rx
         .recv()
@@ -189,7 +193,7 @@ struct CoalescingResizeListener {
 impl EventListener for CoalescingResizeListener {
     type Error = io::Error;
 
-    async fn title(&self, title: String) -> Result<(), Self::Error> {
+    async fn title(&mut self, title: String) -> Result<(), Self::Error> {
         if title == "ready" {
             // Retaining this guard makes premature resize processing wait on
             // state owned by the pending callback. The test's later successful
@@ -206,7 +210,7 @@ impl EventListener for CoalescingResizeListener {
         Ok(())
     }
 
-    async fn resize_result(&self, result: io::Result<WindowSize>) -> Result<(), Self::Error> {
+    async fn resize_result(&mut self, result: io::Result<WindowSize>) -> Result<(), Self::Error> {
         let window_size = result?;
         let terminal_dimensions = {
             let terminal = self.handle.terminal().await;
@@ -240,8 +244,8 @@ async fn listener_resizes_are_coalesced_and_reported_as_events() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         input: _input,
         ..
     } = pty;
@@ -275,18 +279,16 @@ async fn listener_resizes_are_coalesced_and_reported_as_events() {
     let (title_pending_tx, mut title_pending_rx) = mpsc::unbounded_channel();
     let release_title = Arc::new(Notify::new());
     let listener_release_title = Arc::clone(&release_title);
-    let (event_loop, handle) =
-        EventLoop::new(output, control, TermConfig::default(), move |handle| {
-            CoalescingResizeListener {
-                handle,
-                initial_requests,
-                follow_up,
-                completions: completions_tx,
-                title_pending: title_pending_tx,
-                release_title: listener_release_title,
-            }
-        });
-    let run = event_loop.run();
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = CoalescingResizeListener {
+        handle: handle.clone(),
+        initial_requests,
+        follow_up,
+        completions: completions_tx,
+        title_pending: title_pending_tx,
+        release_title: listener_release_title,
+    };
+    let run = event_loop.run(&mut control, &mut output, &mut listener);
     tokio::pin!(run);
     tokio::select! {
         pending = title_pending_rx.recv() => {
@@ -303,11 +305,11 @@ async fn listener_resizes_are_coalesced_and_reported_as_events() {
     .await;
     release_title.notify_one();
 
-    let (_output, _control) = run.as_mut().await.unwrap();
+    run.as_mut().await.unwrap();
     handle.wait_for_shutdown().await;
 
     let mut completions = Vec::new();
-    while let Some(completion) = completions_rx.recv().await {
+    while let Ok(completion) = completions_rx.try_recv() {
         completions.push(completion);
     }
     let observed_completions = completions
@@ -392,7 +394,7 @@ struct DsrListener {
 impl EventListener for DsrListener {
     type Error = io::Error;
 
-    async fn pty_write(&self, reply: String) -> Result<(), Self::Error> {
+    async fn pty_write(&mut self, reply: String) -> Result<(), Self::Error> {
         let disposition = match self.input.try_lock() {
             Err(_) => ReplyDisposition::LockContended,
             Ok(mut input) => {
@@ -434,21 +436,25 @@ async fn listener_can_drop_best_effort_replies() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         input,
         ..
     } = pty;
     let input = Arc::new(Mutex::new(input));
     let (reports_tx, mut reports_rx) = mpsc::unbounded_channel();
     let listener_input = Arc::clone(&input);
-    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), move |_| {
-        DsrListener {
-            input: listener_input,
-            reports: reports_tx,
-        }
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = DsrListener {
+        input: listener_input,
+        reports: reports_tx,
+    };
+    let task = tokio::spawn(async move {
+        event_loop
+            .run(&mut control, &mut output, &mut listener)
+            .await
+            .map(|()| (output, control))
     });
-    let task = tokio::spawn(event_loop.run());
 
     let first = reports_rx
         .recv()
@@ -512,15 +518,19 @@ async fn child_exit_does_not_stop_event_loop() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         mut input,
         ..
     } = pty;
-    let (event_loop, handle) = EventLoop::new(output, control, TermConfig::default(), |_| {
-        asyncritty::VoidListener
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
+    let mut listener = asyncritty::VoidListener;
+    let task = tokio::spawn(async move {
+        event_loop
+            .run(&mut control, &mut output, &mut listener)
+            .await
+            .map(|()| (output, control))
     });
-    let task = tokio::spawn(event_loop.run());
 
     let status = child.wait().await.unwrap();
     // The group leader has been reaped, so cleanup must not address its reusable ID.
@@ -550,13 +560,6 @@ async fn child_exit_does_not_stop_event_loop() {
     assert_eq!(child.wait().await.unwrap().code(), Some(7));
 }
 
-/// Accepts events without adding behavior to lifecycle tests.
-struct PassiveListener;
-
-impl EventListener for PassiveListener {
-    type Error = Infallible;
-}
-
 /// Dropping an event loop before it runs makes pending and later shutdown waits
 /// ready.
 #[tokio::test(flavor = "current_thread")]
@@ -567,13 +570,12 @@ async fn dropping_unrun_event_loop_completes_shutdown_wait() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
+        output: _output,
         control,
         input: _input,
         ..
     } = pty;
-    let (event_loop, handle) =
-        EventLoop::new(output, control, TermConfig::default(), |_| PassiveListener);
+    let (event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
     let shutdown_wait = handle.wait_for_shutdown();
     tokio::pin!(shutdown_wait);
 
@@ -621,7 +623,7 @@ struct GatedWakeupListener {
 impl EventListener for GatedWakeupListener {
     type Error = io::Error;
 
-    async fn wakeup(&self) -> Result<(), Self::Error> {
+    async fn wakeup(&mut self) -> Result<(), Self::Error> {
         self.entered.notify_one();
         self.release
             .acquire()
@@ -634,14 +636,14 @@ impl EventListener for GatedWakeupListener {
         }
     }
 
-    async fn resize_result(&self, _result: io::Result<WindowSize>) -> Result<(), Self::Error> {
+    async fn resize_result(&mut self, _result: io::Result<WindowSize>) -> Result<(), Self::Error> {
         self.resize_result_delivered.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
 
-/// Explicit shutdown waits for the active callback to succeed, then discards
-/// events already queued behind it.
+/// Explicit shutdown waits for the active callback to succeed, then stops
+/// delivery of events queued behind it.
 #[tokio::test(flavor = "current_thread")]
 #[ntest::timeout(15_000)]
 async fn shutdown_waits_for_pending_listener_to_succeed() {
@@ -649,22 +651,21 @@ async fn shutdown_waits_for_pending_listener_to_succeed() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         input: _input,
         ..
     } = pty;
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Semaphore::new(0));
     let resize_result_delivered = Arc::new(AtomicBool::new(false));
-    let listener = GatedWakeupListener {
+    let mut listener = GatedWakeupListener {
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
         outcome: WakeupOutcome::Success,
         resize_result_delivered: Arc::clone(&resize_result_delivered),
     };
-    let (event_loop, handle) =
-        EventLoop::new(output, control, TermConfig::default(), move |_| listener);
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
     {
         let _terminal = handle.terminal().await;
     }
@@ -674,7 +675,7 @@ async fn shutdown_waits_for_pending_listener_to_succeed() {
         cell_width: 9,
         cell_height: 18,
     });
-    let run = event_loop.run();
+    let run = event_loop.run(&mut control, &mut output, &mut listener);
     tokio::pin!(run);
 
     tokio::select! {
@@ -696,11 +697,11 @@ async fn shutdown_waits_for_pending_listener_to_succeed() {
     );
 
     release.add_permits(1);
-    let (_output, _control) = run.as_mut().await.unwrap();
+    run.as_mut().await.unwrap();
     shutdown_wait.as_mut().await;
     assert!(
         !resize_result_delivered.load(Ordering::SeqCst),
-        "shutdown should discard the resize result queued behind the wakeup",
+        "shutdown should defer the resize result queued behind the wakeup",
     );
 
     stop_child(&mut child).await;
@@ -708,7 +709,7 @@ async fn shutdown_waits_for_pending_listener_to_succeed() {
 }
 
 /// A listener error produced after shutdown is requested remains the event-loop
-/// result, and events already queued behind it are discarded.
+/// result, and events already queued behind it are not delivered in that run.
 #[tokio::test(flavor = "current_thread")]
 #[ntest::timeout(15_000)]
 async fn shutdown_reports_pending_listener_failure() {
@@ -716,22 +717,21 @@ async fn shutdown_reports_pending_listener_failure() {
     let mut child_guard = ChildProcessGuard::for_pty(&pty);
     let Pty {
         mut child,
-        output,
-        control,
+        mut output,
+        mut control,
         input: _input,
         ..
     } = pty;
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Semaphore::new(0));
     let resize_result_delivered = Arc::new(AtomicBool::new(false));
-    let listener = GatedWakeupListener {
+    let mut listener = GatedWakeupListener {
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
         outcome: WakeupOutcome::Failure,
         resize_result_delivered: Arc::clone(&resize_result_delivered),
     };
-    let (event_loop, handle) =
-        EventLoop::new(output, control, TermConfig::default(), move |_| listener);
+    let (mut event_loop, handle) = EventLoop::new(TermConfig::default(), &control);
     {
         let _terminal = handle.terminal().await;
     }
@@ -741,7 +741,7 @@ async fn shutdown_reports_pending_listener_failure() {
         cell_width: 9,
         cell_height: 18,
     });
-    let run = event_loop.run();
+    let run = event_loop.run(&mut control, &mut output, &mut listener);
     tokio::pin!(run);
 
     tokio::select! {
@@ -759,12 +759,12 @@ async fn shutdown_reports_pending_listener_failure() {
     release.add_permits(1);
     let failure = run.as_mut().await.unwrap_err();
     assert!(matches!(
-        &failure.error,
+        &failure,
         EventLoopError::Listener(error) if error.kind() == io::ErrorKind::Other
     ));
     assert!(
         !resize_result_delivered.load(Ordering::SeqCst),
-        "shutdown should discard the resize result queued behind the wakeup",
+        "shutdown should defer the resize result queued behind the wakeup",
     );
 
     stop_child(&mut child).await;

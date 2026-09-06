@@ -172,7 +172,8 @@ impl PtyControl {
     /// Changes the terminal size reported to programs using the PTY.
     ///
     /// After a successful resize, [`EventLoop::new`](crate::EventLoop::new)
-    /// uses this size to initialize its terminal model. To resize a running
+    /// uses this size to initialize its terminal model, and each call to
+    /// [`EventLoop::run`](crate::EventLoop::run) rechecks it. To resize a running
     /// event loop, use [`EventLoopHandle::resize`](crate::EventLoopHandle::resize).
     ///
     /// # Errors
@@ -209,8 +210,8 @@ impl AsRawFd for PtyControl {
 /// The inherent methods forward process operations to [`Self::child`] and
 /// resizing to [`Self::control`]. Move the fields out to handle each direction,
 /// terminal control, and the child independently.
-/// [`EventLoop`](crate::EventLoop) takes `child`, `output`, and `control`,
-/// leaving `input` available for application writes.
+/// [`EventLoop::run`](crate::EventLoop::run) borrows `output` and `control`,
+/// leaving `input` available for application writes and `child` for waiting.
 #[derive(Debug)]
 pub struct Pty {
     /// Path to the slave terminal device, recorded during construction.

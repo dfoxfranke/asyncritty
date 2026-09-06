@@ -5,10 +5,10 @@
 //! [`alacritty_terminal::Term`], using Tokio for asynchronous I/O.
 //!
 //! [`Pty::spawn`] starts a [`Command`] with its standard streams attached to the
-//! terminal. Pass its output and control handles to [`EventLoop::new`], then
-//! drive the terminal with [`EventLoop::run`]. The application retains [`Child`]
-//! for independent waiting and signaling, and [`PtyInput`] for keystrokes and
-//! terminal replies.
+//! terminal. Create a terminal model with [`EventLoop::new`], then borrow the
+//! output and control handles to drive it with [`EventLoop::run`]. The application
+//! retains [`Child`] for independent waiting and signaling, and [`PtyInput`] for
+//! keystrokes and terminal replies.
 //!
 //! [`EventLoopHandle`] provides access to the terminal state for rendering,
 //! along with resize and shutdown requests. Implement [`EventListener`] to
@@ -37,13 +37,15 @@
 //!         cell_width: 8,
 //!         cell_height: 16,
 //!     };
-//!     let Pty { mut child, output, control, input: _input, .. } = Pty::spawn(command, size)?;
-//!     let (event_loop, handle) = EventLoop::new(
-//!         output, control, Default::default(), |_| VoidListener,
-//!     );
+//!     let Pty { mut child, mut output, mut control, input: _input, .. } = Pty::spawn(command, size)?;
+//!     let (mut event_loop, handle) = EventLoop::new(Default::default(), &control);
+//!     let mut listener = VoidListener;
 //!
-//!     let (loop_result, status) = tokio::join!(event_loop.run(), child.wait());
-//!     let (_output, _control) = loop_result?;
+//!     let (loop_result, status) = tokio::join!(
+//!         event_loop.run(&mut control, &mut output, &mut listener),
+//!         child.wait(),
+//!     );
+//!     loop_result?;
 //!     let status = status?;
 //!     let terminal = handle.terminal().await;
 //!     let screen = terminal.bounds_to_string(
@@ -72,7 +74,7 @@ pub use alacritty_terminal::{
     term::{Config, Term},
 };
 pub use event::{EventListener, SyncEventProxy, VoidListener};
-pub use event_loop::{EventLoop, EventLoopError, EventLoopFailure, EventLoopHandle};
+pub use event_loop::{EventLoop, EventLoopError, EventLoopHandle};
 pub use process::{Child, Command};
 pub use terminal::TerminalReadGuard;
 pub use tty::{Pty, PtyControl, PtyInput, PtyOutput};
