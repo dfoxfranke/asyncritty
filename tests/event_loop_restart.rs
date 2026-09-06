@@ -7,9 +7,11 @@ mod common;
 
 use std::convert::Infallible;
 use std::fs::File;
-use std::future::pending;
+use std::future::{Future as _, pending};
 use std::io::{self, Write as _};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::task::{Context, Waker};
 
 use asyncritty::alacritty_terminal::grid::Dimensions as _;
 use asyncritty::alacritty_terminal::index::Point;
@@ -44,6 +46,81 @@ fn fixture() -> (Pty, File, ChildProcessGuard) {
     .unwrap();
     let guard = ChildProcessGuard::for_pty(&pty);
     (pty, slave, guard)
+}
+
+/// Assert PTY identity equality for all nine ordered capability pairs.
+///
+/// # Panics
+///
+/// Panics if any comparison differs from `expected`.
+fn assert_capability_equality(left: &Pty, right: &Pty, expected: bool) {
+    assert_eq!(left.input == right.input, expected);
+    assert_eq!(left.input == right.output, expected);
+    assert_eq!(left.input == right.control, expected);
+    assert_eq!(left.output == right.input, expected);
+    assert_eq!(left.output == right.output, expected);
+    assert_eq!(left.output == right.control, expected);
+    assert_eq!(left.control == right.input, expected);
+    assert_eq!(left.control == right.output, expected);
+    assert_eq!(left.control == right.control, expected);
+}
+
+/// All ordered capability pairs compare by PTY identity, including after a
+/// resize; distinct PTYs with the same geometry compare unequal.
+#[tokio::test]
+#[ntest::timeout(15_000)]
+async fn capability_equality_identifies_the_pty() {
+    let (mut first, _first_slave, mut first_guard) = fixture();
+    let (mut second, _second_slave, mut second_guard) = fixture();
+    for (left, right, expected) in [
+        (&first, &first, true),
+        (&second, &second, true),
+        (&first, &second, false),
+        (&second, &first, false),
+    ] {
+        assert_capability_equality(left, right, expected);
+    }
+
+    first
+        .control
+        .resize(WindowSize {
+            num_lines: 31,
+            num_cols: 97,
+            cell_width: 9,
+            cell_height: 18,
+        })
+        .unwrap();
+    assert_capability_equality(&first, &first, true);
+    assert_capability_equality(&first, &second, false);
+
+    first.child.kill().await.unwrap();
+    first_guard.disarm();
+    second.child.kill().await.unwrap();
+    second_guard.disarm();
+}
+
+/// Mismatched PTY capabilities panic on the first poll, even when shutdown
+/// was requested before the run began.
+#[tokio::test]
+#[ntest::timeout(15_000)]
+async fn mismatched_control_and_output_panic() {
+    let (mut first, _first_slave, mut first_guard) = fixture();
+    let (mut second, _second_slave, mut second_guard) = fixture();
+    let (mut event_loop, handle) = EventLoop::new(Default::default(), &first.control);
+    let mut listener = asyncritty::VoidListener;
+    handle.shutdown();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut run =
+            std::pin::pin!(event_loop.run(&mut first.control, &mut second.output, &mut listener,));
+        run.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+    }));
+    assert!(result.is_err(), "different terminals must be rejected");
+
+    first.child.kill().await.unwrap();
+    first_guard.disarm();
+    second.child.kill().await.unwrap();
+    second_guard.disarm();
 }
 
 /// Retains callback arguments in ordinary mutable fields, then stops each run.

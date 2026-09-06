@@ -30,6 +30,9 @@ use crate::process::{Child, Command};
 ///
 /// Closing the slave end can produce EOF or an `EIO` error, depending on the
 /// platform.
+///
+/// Equality with [`PtyInput`], [`PtyOutput`], or [`PtyControl`] tests whether
+/// the handles share the same PTY instance.
 #[derive(Debug)]
 pub struct PtyOutput {
     /// Shared nonblocking descriptor and its Tokio readiness registration.
@@ -95,6 +98,9 @@ impl AsyncRead for PtyOutput {
 ///
 /// Use [`AsyncWrite`] to send input. Writes are unbuffered; flushing and writer
 /// shutdown complete immediately, and shutdown leaves the PTY open.
+///
+/// Equality with [`PtyInput`], [`PtyOutput`], or [`PtyControl`] tests whether
+/// the handles share the same PTY instance.
 #[derive(Debug)]
 pub struct PtyInput {
     /// Shared nonblocking descriptor and its Tokio readiness registration.
@@ -159,6 +165,9 @@ impl AsyncWrite for PtyInput {
 }
 
 /// Window-size control for a [`Pty`].
+///
+/// Equality with [`PtyInput`], [`PtyOutput`], or [`PtyControl`] tests whether
+/// the handles share the same PTY instance.
 #[derive(Debug)]
 pub struct PtyControl {
     /// Shared controller descriptor and its Tokio readiness registration.
@@ -203,6 +212,23 @@ impl AsRawFd for PtyControl {
         self.inner.get_ref().as_raw_fd()
     }
 }
+
+/// Implement PTY identity comparisons between capability types.
+macro_rules! impl_pty_eq {
+    ($left:ty, $($right:ty),+ $(,)?) => {
+        $(
+            impl PartialEq<$right> for $left {
+                fn eq(&self, other: &$right) -> bool {
+                    Arc::ptr_eq(&self.inner, &other.inner)
+                }
+            }
+        )+
+    };
+}
+
+impl_pty_eq!(PtyInput, PtyInput, PtyOutput, PtyControl);
+impl_pty_eq!(PtyOutput, PtyInput, PtyOutput, PtyControl);
+impl_pty_eq!(PtyControl, PtyInput, PtyOutput, PtyControl);
 
 /// A child process and the master end of its pseudoterminal.
 ///

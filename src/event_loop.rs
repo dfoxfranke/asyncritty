@@ -390,7 +390,7 @@ impl EventLoop {
     /// May panic when first polled outside a Tokio runtime. May also panic if
     /// parsed output starts a synchronized update while the runtime has no time
     /// driver. Panics if `control`'s recorded window size has no lines or fewer
-    /// than two columns.
+    /// than two columns, or if `control` and `output` belong to different PTYs.
     pub async fn run<L: EventListener>(
         &mut self,
         control: &mut PtyControl,
@@ -399,6 +399,10 @@ impl EventLoop {
     ) -> Result<(), EventLoopError<L::Error>> {
         self.stop_on_drop.0.restart();
         let _stop_on_return = StopOnDrop(self.stop_on_drop.0.clone());
+        assert_eq!(
+            control, output,
+            "control and output must belong to the same terminal"
+        );
         let window_size = control.recorded_window_size();
         assert!(
             window_size.num_lines > 0,
