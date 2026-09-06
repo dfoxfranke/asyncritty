@@ -120,11 +120,6 @@ pub trait EventListener: Send + Sync + 'static {
         ready(Ok(()))
     }
 
-    /// Handle a shutdown request from the terminal model.
-    fn exit(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        ready(Ok(()))
-    }
-
     /// Handle the outcome of an [`EventLoopHandle::resize`](crate::EventLoopHandle::resize)
     /// request, or a size change detected when [`EventLoop::run`](crate::EventLoop::run)
     /// starts.
@@ -191,7 +186,7 @@ pub(crate) async fn dispatch_event<L: EventListener + ?Sized>(
             TerminalEvent::CursorBlinkingChange => listener.cursor_blinking_change().await,
             TerminalEvent::Wakeup => listener.wakeup().await,
             TerminalEvent::Bell => listener.bell().await,
-            TerminalEvent::Exit => listener.exit().await,
+            TerminalEvent::Exit => unreachable!("SyncEventProxy rejects terminal exit events"),
             // Child supervision belongs to the application. Alacritty's enum
             // includes this variant, but this loop does not produce it.
             TerminalEvent::ChildExit(_) => Ok(()),
@@ -233,6 +228,9 @@ impl SyncEventProxy {
 
 impl AlacrittyEventListener for SyncEventProxy {
     fn send_event(&self, event: TerminalEvent) {
+        if matches!(event, TerminalEvent::Exit) {
+            unreachable!("asyncritty must not call Term::exit");
+        }
         self.events().push_back(Event::Terminal(event));
     }
 }
@@ -279,9 +277,6 @@ mod tests {
 
         /// Terminal bell rang.
         Bell,
-
-        /// Terminal application requested shutdown.
-        Exit,
 
         /// Applied geometry or resize failure kind.
         ResizeResult(Result<(u16, u16, u16, u16), io::ErrorKind>),
@@ -395,11 +390,6 @@ mod tests {
             ready(Ok(()))
         }
 
-        fn exit(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            self.record(Observation::Exit);
-            ready(Ok(()))
-        }
-
         fn resize_result(
             &mut self,
             result: io::Result<WindowSize>,
@@ -472,7 +462,6 @@ mod tests {
             TerminalEvent::CursorBlinkingChange.into(),
             TerminalEvent::Wakeup.into(),
             TerminalEvent::Bell.into(),
-            TerminalEvent::Exit.into(),
             TerminalEvent::ChildExit(ExitStatus::from_raw(7 << 8)).into(),
             Event::ResizeResult(Ok(WindowSize {
                 num_lines: 31,
@@ -504,7 +493,6 @@ mod tests {
                 Observation::CursorBlinkingChange,
                 Observation::Wakeup,
                 Observation::Bell,
-                Observation::Exit,
                 Observation::ResizeResult(Ok((31, 97, 9, 18))),
                 Observation::ResizeResult(Err(io::ErrorKind::PermissionDenied)),
             ]
@@ -526,7 +514,6 @@ mod tests {
             TerminalEvent::CursorBlinkingChange.into(),
             TerminalEvent::Wakeup.into(),
             TerminalEvent::Bell.into(),
-            TerminalEvent::Exit.into(),
             TerminalEvent::ChildExit(ExitStatus::from_raw(0)).into(),
             Event::ResizeResult(Ok(WindowSize {
                 num_lines: 1,
