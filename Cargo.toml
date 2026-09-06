@@ -5,7 +5,7 @@ resolver = "3"
 
 [package]
 name = "asyncritty"
-version = "0.1.0-alpha2"
+version = "0.1.0-alpha3"
 edition = "2024"
 license = "Apache-2.0"
 description = "Async Tokio integration for alacritty_terminal"
